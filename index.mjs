@@ -27,7 +27,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { chromium } from "playwright";
 import { z } from "zod";
-import { mkdirSync } from "node:fs";
+import { mkdirSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import * as os from "node:os";
 import { spawn } from "node:child_process";
@@ -37,6 +37,15 @@ const AGENT_DIR = join(os.homedir(), ".pi", "agent");
 const ISOLATED_PROFILE = join(AGENT_DIR, "bw-mcp-profile");
 const CDP_ENDPOINT = "http://127.0.0.1:9222";
 const CHROME_STARTER = join(AGENT_DIR, "start-agent-chrome.sh");
+
+// Windows: 自动查找系统 Chrome，CDP 模式专用 profile
+const IS_WIN = process.platform === "win32";
+const CDP_PROFILE = join(AGENT_DIR, "chrome-cdp-profile");
+const CHROME_CANDIDATES_WIN = [
+  join(os.homedir(), "AppData", "Local", "Google", "Chrome", "Application", "chrome.exe"),
+  "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+  "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
+];
 const SNAPSHOT_MAX_CHARS = 12000;
 const SHUTDOWN_TIMEOUT_MS = 3000;
 const CHROME_BOOT_TIMEOUT_MS = 20000; // 自动拉起 Chrome 的最长等待
@@ -74,6 +83,24 @@ function chromeUp() {
 }
 
 function spawnStarter() {
+  // Windows: 直接 spawn chrome.exe（无 bash/nohup）
+  // Windows: 直接 spawn chrome.exe（无 bash/nohup）
+  if (IS_WIN) {
+    try {
+      const exe = CHROME_CANDIDATES_WIN.find((p) => existsSync(p));
+      if (!exe) return false;
+      const child = spawn(
+        exe,
+        ["--remote-debugging-port=9222", `--user-data-dir=${CDP_PROFILE}`, "--no-first-run", "--no-default-browser-check"],
+        { stdio: "ignore", detached: true },
+      );
+      child.on("error", () => {});
+      child.unref();
+      return true;
+    } catch {
+      return false;
+    }
+  }
   // 用 nohup + shell 后台(detached:true 在本环境下 Chrome 起不来)。
   // bash -c "nohup ... &" 让 Chrome 脱离 node 进程独立长驻。
   try {
@@ -306,56 +333,101 @@ function createServer() {
     }
   });
 
-  // 3. snapshot
-  server.registerTool("browser_snapshot", {
-    description: "返回页面 ARIA 无障碍树(YAML 文本,带 role+name)。据此调 click/type 时提供 role+name。",
-  }, async () => {
-    try {
-      const s = await ensureSession();
-      let t = await s.page.locator("body").ariaSnapshot();
-      if (t.length > SNAPSHOT_MAX_CHARS) t = t.slice(0, SNAPSHOT_MAX_CHARS) + "\n…[截断,缩小操作范围或滚动后再 snapshot]";
-      return ok(t);
-    } catch (e) {
-      return err("snapshot 失败", e);
-    }
-  });
+ // 3. snapshot
+ server.registerTool("browser_snapshot", {
+   description: "返回页面可交互元素快照(带 ref 编号)。据此调 click/type 时提供 ref 优先定位。也可用 role+name fallback。",
+ }, async () => {
+   try {
+     const s = await ensureSession();
+     // 注入 JS：扫描可交互元素 + 分配 data-agent-ref（借鉴 Cursor Element Ref 系统）
+     const t = await s.page.evaluate((maxChars) => {
+       const sel = [
+         'input','textarea','select','button','a[href]',
+         '[role="button"]','[role="link"]','[role="textbox"]',
+         '[role="checkbox"]','[role="radio"]','[role="combobox"]',
+         '[role="listbox"]','[role="menuitem"]','[role="menuitemcheckbox"]',
+         '[role="menuitemradio"]','[role="option"]','[role="slider"]',
+         '[role="spinbutton"]','[role="switch"]','[role="tab"]',
+         '[role="treeitem"]','[role="searchbox"]',
+         '[contenteditable="true"]','summary',
+         '[tabindex]:not([tabindex="-1"])',
+       ].join(',');
+       // 穿透 open shadow root
+       function deepQuery(root, s) {
+         const out = [...root.querySelectorAll(s)];
+         for (const el of root.querySelectorAll('*')) {
+           if (el.shadowRoot) out.push(...deepQuery(el.shadowRoot, s));
+         }
+         return out;
+       }
+       // 清理旧 ref
+       document.querySelectorAll('[data-agent-ref]').forEach(el => el.removeAttribute('data-agent-ref'));
+       const els = deepQuery(document, sel).filter(el =>
+         el.getAttribute('aria-hidden') !== 'true' && (el.offsetParent !== null || getComputedStyle(el).position === 'fixed' || getComputedStyle(el).position === 'sticky'));
+       const lines = els.map((el, i) => {
+         const ref = 'e' + (i + 1);
+         el.setAttribute('data-agent-ref', ref);
+         const role = el.getAttribute('role') || el.tagName.toLowerCase();
+         const name = (el.getAttribute('aria-label') ||
+           el.textContent?.trim()?.slice(0, 80) ||
+           el.placeholder || el.title || '').slice(0, 80);
+         return `- [ref=${ref}] ${role}${name ? ` "${name}"` : ''}`;
+       });
+       let text = lines.join('\n');
+       if (text.length > maxChars)
+         text = text.slice(0, maxChars) + '\n…[截断,缩小范围或滚动后再 snapshot]';
+       return text || '(无可交互元素)';
+     }, SNAPSHOT_MAX_CHARS);
+     return ok(t);
+   } catch (e) {
+     return err("snapshot 失败", e);
+   }
+ });
 
-  // 4. click
-  server.registerTool("browser_click", {
-    description: "点击页面元素,用 snapshot 里的 role(+name) 定位。",
-    inputSchema: {
-      role: z.string().describe("元素 role,见 snapshot 输出(如 link/button/textbox)"),
-      name: z.string().optional().describe("元素的可访问名称(accessible name)"),
-    },
-  }, async (params) => {
-    try {
-      const s = await ensureSession();
-      const loc = locateByRole(s.page, params.role, params.name);
-      await loc.click({ timeout: 10000 });
-      return ok(`已点击 ${params.role}${params.name ? ` "${params.name}"` : ""}`);
-    } catch (e) {
-      return err("点击失败", e);
-    }
-  });
+ // 4. click
+ server.registerTool("browser_click", {
+   description: "点击页面元素。优先用 snapshot 返回的 ref 定位(如 e3),也可用 role+name fallback。",
+   inputSchema: {
+     ref: z.string().optional().describe("snapshot 返回的元素 ref(如 e3),优先使用"),
+     role: z.string().optional().describe("元素 role(ref 未提供时使用,见 snapshot 输出)"),
+     name: z.string().optional().describe("元素的可访问名称(accessible name)"),
+   },
+ }, async (params) => {
+   if (!params.ref && !params.role) return err("参数缺失", new Error("必须提供 ref 或 role"));
+   try {
+     const s = await ensureSession();
+     const loc = params.ref
+       ? s.page.locator(`[data-agent-ref="${params.ref}"]`).first()
+       : locateByRole(s.page, params.role || "", params.name);
+     await loc.click({ timeout: 10000 });
+     return ok(`已点击 ${params.ref ? `ref=${params.ref}` : `${params.role}${params.name ? ` "${params.name}"` : ''}`}`);
+   } catch (e) {
+     return err("点击失败", e);
+   }
+ });
 
-  // 5. type
-  server.registerTool("browser_type", {
-    description: "在输入框(role 通常 textbox)输入文本,用 role+name 定位。",
-    inputSchema: {
-      role: z.string().describe("元素 role(通常 textbox/searchbox/combobox)"),
-      name: z.string().optional().describe("输入框的可访问名称"),
-      text: z.string().describe("要输入的文本"),
-    },
-  }, async (params) => {
-    try {
-      const s = await ensureSession();
-      const loc = locateByRole(s.page, params.role, params.name);
-      await loc.fill(params.text, { timeout: 10000 });
-      return ok(`已在 ${params.role}${params.name ? ` "${params.name}"` : ""} 输入 ${JSON.stringify(params.text)}`);
-    } catch (e) {
-      return err("输入失败", e);
-    }
-  });
+ // 5. type
+ server.registerTool("browser_type", {
+   description: "在输入框输入文本。优先用 snapshot 返回的 ref 定位(如 e3),也可用 role+name fallback。",
+   inputSchema: {
+     ref: z.string().optional().describe("snapshot 返回的元素 ref(如 e3),优先使用"),
+     role: z.string().optional().describe("元素 role(ref 未提供时使用,通常 textbox/searchbox/combobox)"),
+     name: z.string().optional().describe("输入框的可访问名称"),
+     text: z.string().describe("要输入的文本"),
+   },
+ }, async (params) => {
+   if (!params.ref && !params.role) return err("参数缺失", new Error("必须提供 ref 或 role"));
+   try {
+     const s = await ensureSession();
+     const loc = params.ref
+       ? s.page.locator(`[data-agent-ref="${params.ref}"]`).first()
+       : locateByRole(s.page, params.role || "", params.name);
+     await loc.fill(params.text, { timeout: 10000 });
+     return ok(`已在 ${params.ref ? `ref=${params.ref}` : `${params.role}${params.name ? ` "${params.name}"` : ''}`} 输入 ${JSON.stringify(params.text)}`);
+   } catch (e) {
+     return err("输入失败", e);
+   }
+ });
 
   // 6. eval
   server.registerTool("browser_eval", {

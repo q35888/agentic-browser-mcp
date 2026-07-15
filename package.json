@@ -1,0 +1,23 @@
+{
+  "name": "agentic-browser-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Pi 浏览器能力 MCP server —— Playwright 驱动专用 Chrome(9222),给 Codex / pi 等 MCP client 用。逻辑与 pi 扩展 browser-tool.ts 对齐。",
+  "main": "index.mjs",
+  "bin": {
+    "agentic-browser-mcp": "./index.mjs"
+  },
+  "scripts": {
+    "start": "node index.mjs",
+    "start:http": "node index.mjs --transport http --port 9223"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "playwright": "^1.61.1",
+    "zod": "^3.25.0"
+  }
+}

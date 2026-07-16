@@ -335,12 +335,16 @@ function createServer() {
 
  // 3. snapshot
  server.registerTool("browser_snapshot", {
-   description: "返回页面可交互元素快照(带 ref 编号)。据此调 click/type 时提供 ref 优先定位。也可用 role+name fallback。",
- }, async () => {
+   description: "返回页面可交互元素快照(带 ref 编号)。默认只返回视口内可操作元素;mode=all 返回全部。据此调 click/type 时提供 ref 优先定位,也可 role+name fallback。",
+   inputSchema: {
+     mode: z.enum(["viewport", "all"]).optional().describe("viewport=只返回当前视口内可交互元素(默认,省 token);all=返回全部(含视口外,需滚动才能操作)"),
+   },
+ }, async (params) => {
    try {
      const s = await ensureSession();
+     const mode = params?.mode ?? "viewport";
      // 注入 JS：扫描可交互元素 + 分配 data-agent-ref（借鉴 Cursor Element Ref 系统）
-     const t = await s.page.evaluate((maxChars) => {
+     const t = await s.page.evaluate(({ maxChars, mode }) => {
        const sel = [
          'input','textarea','select','button','a[href]',
          '[role="button"]','[role="link"]','[role="textbox"]',
@@ -360,24 +364,58 @@ function createServer() {
          }
          return out;
        }
-       // 清理旧 ref
-       document.querySelectorAll('[data-agent-ref]').forEach(el => el.removeAttribute('data-agent-ref'));
-       const els = deepQuery(document, sel).filter(el =>
-         el.getAttribute('aria-hidden') !== 'true' && (el.offsetParent !== null || getComputedStyle(el).position === 'fixed' || getComputedStyle(el).position === 'sticky'));
+       // 隐式 ARIA role 映射（让输出的 role 与 Playwright getByRole 的 fallback 一致）
+       function implicitRole(el) {
+         const r = el.getAttribute('role');
+         if (r) return r;
+         const t = el.tagName.toLowerCase();
+         if (t === 'a' && el.hasAttribute('href')) return 'link';
+         if (t === 'button' || t === 'summary') return 'button';
+         if (t === 'textarea') return 'textbox';
+         if (t === 'input') {
+           const ty = (el.getAttribute('type') || 'text').toLowerCase();
+           return ({checkbox:'checkbox', radio:'radio', search:'searchbox'})[ty] || 'textbox';
+         }
+         if (t === 'select') return 'combobox';
+         return t;
+       }
+       // 清理旧 ref（穿透 shadow root，避免旧 ref 残留与新编号冲突）
+       deepQuery(document, '[data-agent-ref]').forEach(el => el.removeAttribute('data-agent-ref'));
+       // 可见性 + 视口过滤
+       const els = deepQuery(document, sel).filter(el => {
+         if (el.getAttribute('aria-hidden') === 'true') return false;
+         const cs = getComputedStyle(el);
+         const rect = el.getBoundingClientRect();
+         const visible =
+           (el.checkVisibility?.({ checkOpacity: true, checkVisibilityCSS: true, contentVisibilityAuto: true }) ?? cs.visibility !== 'hidden')
+           && rect.width > 0 && rect.height > 0;
+         if (!visible) return false;
+         if (mode === 'viewport') {
+           return rect.bottom > 0 && rect.right > 0 && rect.top < innerHeight && rect.left < innerWidth;
+         }
+         return true;
+       });
        const lines = els.map((el, i) => {
          const ref = 'e' + (i + 1);
          el.setAttribute('data-agent-ref', ref);
-         const role = el.getAttribute('role') || el.tagName.toLowerCase();
+         const role = implicitRole(el);
          const name = (el.getAttribute('aria-label') ||
+           el.getAttribute('aria-labelledby') ||
            el.textContent?.trim()?.slice(0, 80) ||
            el.placeholder || el.title || '').slice(0, 80);
          return `- [ref=${ref}] ${role}${name ? ` "${name}"` : ''}`;
        });
-       let text = lines.join('\n');
-       if (text.length > maxChars)
-         text = text.slice(0, maxChars) + '\n…[截断,缩小范围或滚动后再 snapshot]';
+       // 整行截断（不切掅单行）+ 统计
+       let text = '', shown = 0;
+       for (const ln of lines) {
+         if (text.length + ln.length + 1 > maxChars) break;
+         text += (text ? '\n' : '') + ln;
+         shown++;
+       }
+       const total = lines.length;
+       if (shown < total) text += `\n…[共 ${total} 项，已返回前 ${shown} 项；mode=all 或滚动后重 snapshot 看更多]`;
        return text || '(无可交互元素)';
-     }, SNAPSHOT_MAX_CHARS);
+     }, { maxChars: SNAPSHOT_MAX_CHARS, mode });
      return ok(t);
    } catch (e) {
      return err("snapshot 失败", e);
@@ -394,11 +432,19 @@ function createServer() {
    },
  }, async (params) => {
    if (!params.ref && !params.role) return err("参数缺失", new Error("必须提供 ref 或 role"));
+   if (params.ref && !/^e\d+$/.test(params.ref)) return err("ref 非法", new Error(`ref 必须形如 e3，收到 ${params.ref}`));
    try {
      const s = await ensureSession();
-     const loc = params.ref
-       ? s.page.locator(`[data-agent-ref="${params.ref}"]`).first()
-       : locateByRole(s.page, params.role || "", params.name);
+     let loc;
+     if (params.ref) {
+       const sel = `[data-agent-ref="${CSS.escape(params.ref)}"]`;
+       const cnt = await s.page.locator(sel).count();
+       if (cnt === 0) return err("ref 失效", new Error(`ref=${params.ref} 未命中（页面可能已变化），请重新 snapshot`));
+       if (cnt > 1) return err("ref 重复", new Error(`ref=${params.ref} 命中 ${cnt} 个（快照内部错误），请重新 snapshot`));
+       loc = s.page.locator(sel).first();
+     } else {
+       loc = locateByRole(s.page, params.role || "", params.name);
+     }
      await loc.click({ timeout: 10000 });
      return ok(`已点击 ${params.ref ? `ref=${params.ref}` : `${params.role}${params.name ? ` "${params.name}"` : ''}`}`);
    } catch (e) {
@@ -417,11 +463,19 @@ function createServer() {
    },
  }, async (params) => {
    if (!params.ref && !params.role) return err("参数缺失", new Error("必须提供 ref 或 role"));
+   if (params.ref && !/^e\d+$/.test(params.ref)) return err("ref 非法", new Error(`ref 必须形如 e3，收到 ${params.ref}`));
    try {
      const s = await ensureSession();
-     const loc = params.ref
-       ? s.page.locator(`[data-agent-ref="${params.ref}"]`).first()
-       : locateByRole(s.page, params.role || "", params.name);
+     let loc;
+     if (params.ref) {
+       const sel = `[data-agent-ref="${CSS.escape(params.ref)}"]`;
+       const cnt = await s.page.locator(sel).count();
+       if (cnt === 0) return err("ref 失效", new Error(`ref=${params.ref} 未命中（页面可能已变化），请重新 snapshot`));
+       if (cnt > 1) return err("ref 重复", new Error(`ref=${params.ref} 命中 ${cnt} 个（快照内部错误），请重新 snapshot`));
+       loc = s.page.locator(sel).first();
+     } else {
+       loc = locateByRole(s.page, params.role || "", params.name);
+     }
      await loc.fill(params.text, { timeout: 10000 });
      return ok(`已在 ${params.ref ? `ref=${params.ref}` : `${params.role}${params.name ? ` "${params.name}"` : ''}`} 输入 ${JSON.stringify(params.text)}`);
    } catch (e) {

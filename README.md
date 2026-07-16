@@ -1,5 +1,7 @@
 # agentic-browser-mcp
 
+**English** | [中文](./README.zh-CN.md)
+
 A standalone **MCP server** that gives any MCP client (Codex, Claude, etc.) browser automation via **Playwright**. Drive a real, already-logged-in Chrome through the Chrome DevTools Protocol — share cookies and sessions across agents.
 
 Originally extracted from the [pi coding agent](https://pi.dev)'s browser extension, now a standalone server so **Codex / pi / any MCP client** can all use the same browser.
@@ -122,6 +124,8 @@ type    { ref: "e2", text: "playwright" }
 > **Refs are ephemeral.** Each `snapshot` renumbers elements from scratch (clearing old `data-agent-ref` attrs, including inside shadow roots), so a `ref` is only valid until the next `snapshot`. If the page changes (navigation, dynamic content), re-run `snapshot` before acting. Output is truncated on whole-line boundaries with a `…[共 N 项，返回 M 项]` summary.
 
 ## Notes
+
+📖 **Using these tools as an AI agent?** Read [`docs/agent-guide.md`](./docs/agent-guide.md) — the ref workflow, when to use `viewport` vs `all`, failure handling, and do's/don'ts.
 
 - **`browser_wait_human`**: this server has no GUI/TUI. It returns a text prompt; the client agent is expected to surface it and wait for the user to reply.
 - **Session sharing**: multiple MCP clients connecting to the same server share one Playwright session (and thus one Chrome). Tool calls are serialized to prevent races.

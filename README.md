@@ -11,7 +11,7 @@ Originally extracted from the [pi coding agent](https://pi.dev)'s browser extens
   - `real` — `connectOverCDP` to an existing Chrome on port `9222` (reuse your logged-in profile: cookies, sessions, 2FA)
   - `isolated` — `launchPersistentContext` with an independent profile (headed/headless)
 - **Auto-launch Chrome**: if port 9222 is down, the server spawns your Chrome starter script and waits for it — no manual browser launch needed.
-- **Stable element targeting**: `snapshot` returns an ARIA accessibility tree (YAML); `click`/`type` target by `role` + `name` — no fragile ref/snapshot layers.
+- **Element Ref targeting** (Cursor-style): `snapshot` numbers every interactive element with a stable `ref` (`e1`, `e2`, …) and returns lines like `- [ref=e3] button "Sign in"`; `click`/`type` target by `ref` for precision, or fall back to `role` + `name`. It pierces open shadow roots and skips `aria-hidden`/off-screen elements — no fragile selector guessing.
 - **Transports**: `stdio` (default, for Codex-style spawn) and `http` (stateless streamable, `--transport http --port 9223`).
 
 ## Requirements
@@ -78,15 +78,35 @@ If you don't start Chrome manually, the server will try to launch `$HOME/.pi/age
 |---|---|
 | `browser_session` | Start/switch a session (`real` / `isolated`, `headless`, `incognito`). No args = ensure default `real`. |
 | `browser_navigate` | Open a URL. |
-| `browser_snapshot` | Return the page's ARIA tree (YAML). Use `role`+`name` for `click`/`type`. |
-| `browser_click` | Click an element by `role` (+`name`). |
-| `browser_type` | Fill an input by `role` (+`name`). |
+| `browser_snapshot` | Return interactive elements with `ref` numbers, e.g. `- [ref=e3] button "Sign in"`. Use `ref` for `click`/`type`. |
+| `browser_click` | Click by `ref` (preferred, e.g. `e3`) or `role` (+`name`). |
+| `browser_type` | Fill an input by `ref` (preferred) or `role` (+`name`). |
 | `browser_eval` | Run a JS expression in the page (read DOM/storage/fire requests). |
 | `browser_storage` | Read `cookies` / `localStorage` / `sessionStorage`. |
 | `browser_console` | Read buffered console logs (optional `level` filter). |
 | `browser_wait_human` | For CAPTCHAs/manual steps — returns a prompt; the calling agent pauses and waits for the user. |
 | `browser_screenshot` | Save a PNG to disk. |
 | `browser_close` | Close the current session (`real` only disconnects CDP, never kills your Chrome). |
+
+## Element targeting (ref)
+
+Every `browser_snapshot` injects a script that scans the page for interactive elements (links, buttons, inputs, `[role]`s, `[contenteditable]`, `[tabindex]`, …), **pierces open shadow roots**, and assigns each visible element a short `ref` id (`e1`, `e2`, …) via a `data-agent-ref` attribute. Elements that are `aria-hidden` or off-screen are filtered out. The returned text looks like:
+
+```
+- [ref=e1] link "Docs"
+- [ref=e2] searchbox "Search"
+- [ref=e3] button "Sign in"
+```
+
+Then call `click` / `type` with that `ref`:
+
+```
+click   { ref: "e3" }                         # precise — the exact element snapshotted
+click   { role: "button", name: "Sign in" }   # fallback when you have no ref
+type    { ref: "e2", text: "playwright" }
+```
+
+> **Refs are ephemeral.** Each `snapshot` renumbers elements from scratch, so a `ref` is only valid until the next `snapshot`. If the page changes (navigation, dynamic content, new elements), re-run `snapshot` before clicking. Old `data-agent-ref` attributes are cleared on every snapshot.
 
 ## Notes
 

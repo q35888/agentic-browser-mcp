@@ -5,3 +5,9 @@ node_modules/
 .idea/
 .vscode/
 *.bak
+
+# 测试残留的浏览器 profile(跨平台路径,别进版本库)
+*-profile/
+*-profile-*/
+bw-test-profile/
+bw-shots/

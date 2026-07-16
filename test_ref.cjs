@@ -1,7 +1,9 @@
 ﻿const { chromium } = require('playwright');
+const path = require('node:path');
+const os = require('node:os');
 (async () => {
     const ctx = await chromium.launchPersistentContext(
-        'C:\\Users\\zhi\\.pi\\agent\\bw-test-profile',
+        path.join(os.homedir(), '.pi', 'agent', 'bw-test-profile'),
         { headless: true, channel: 'chrome' }
     );
     const page = ctx.pages()[0] || await ctx.newPage();

@@ -437,7 +437,7 @@ function createServer() {
      const s = await ensureSession();
      let loc;
      if (params.ref) {
-       const sel = `[data-agent-ref="${CSS.escape(params.ref)}"]`;
+       const sel = `[data-agent-ref="${params.ref}"]`;
        const cnt = await s.page.locator(sel).count();
        if (cnt === 0) return err("ref 失效", new Error(`ref=${params.ref} 未命中（页面可能已变化），请重新 snapshot`));
        if (cnt > 1) return err("ref 重复", new Error(`ref=${params.ref} 命中 ${cnt} 个（快照内部错误），请重新 snapshot`));
@@ -468,7 +468,7 @@ function createServer() {
      const s = await ensureSession();
      let loc;
      if (params.ref) {
-       const sel = `[data-agent-ref="${CSS.escape(params.ref)}"]`;
+       const sel = `[data-agent-ref="${params.ref}"]`;
        const cnt = await s.page.locator(sel).count();
        if (cnt === 0) return err("ref 失效", new Error(`ref=${params.ref} 未命中（页面可能已变化），请重新 snapshot`));
        if (cnt > 1) return err("ref 重复", new Error(`ref=${params.ref} 命中 ${cnt} 个（快照内部错误），请重新 snapshot`));

@@ -125,7 +125,7 @@ type    { ref: "e2", text: "playwright" }
 
 ## Notes
 
-📖 **Using these tools as an AI agent?** Read [`docs/agent-guide.md`](./docs/agent-guide.md) — the ref workflow, when to use `viewport` vs `all`, failure handling, and do's/don'ts.
+📖 **Helping a user set up this MCP?** Read [`docs/agent-guide.md`](./docs/agent-guide.md) — environment discovery, install, per-client config (Codex/Claude Desktop/Cursor), Chrome setup, verification, and common pitfalls.
 
 - **`browser_wait_human`**: this server has no GUI/TUI. It returns a text prompt; the client agent is expected to surface it and wait for the user to reply.
 - **Session sharing**: multiple MCP clients connecting to the same server share one Playwright session (and thus one Chrome). Tool calls are serialized to prevent races.

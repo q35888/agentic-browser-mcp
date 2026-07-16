@@ -125,7 +125,7 @@ type    { ref: "e2", text: "playwright" }
 
 ## 给 AI Agent 的操作指南
 
-用这套工具的 AI agent,请务必阅读 [`docs/agent-guide.md`](./docs/agent-guide.md)——里面有 ref 工作流、何时用 viewport/all、失败处理等最佳实践。
+帮用户把这个 MCP 配置到各种 client(Codex / Claude Desktop / Cursor 等)的 AI agent,请阅读 [`docs/agent-guide.md`](./docs/agent-guide.md)——摸清环境、装依赖、写配置、验证、踩坑全覆盖。
 
 ## 备注
 

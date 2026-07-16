@@ -1,181 +1,223 @@
-# AI Agent 操作指南:agentic-browser-mcp
+# AI Agent 操作指南:帮用户配置 agentic-browser-mcp
 
-> 本文档面向**调用这套浏览器工具的 AI agent**(Codex / Claude / pi / 任意 MCP client)。读完你应能高效、可靠地完成浏览器自动化任务。
+> 本文档面向 **AI agent**(Codex / Claude / pi / 任意助手)。你的任务是**帮用户把这个 MCP server 安装并配置到他使用的 MCP client 里**,让它能正常驱动浏览器。读完你应能端到端完成一次配置。
 
-## 核心工作流(最重要)
+## 核心流程
 
 ```
-navigate → snapshot → (找目标元素的 ref) → click/type → snapshot(确认结果) → ...
+摸清环境 → 装依赖 → 写配置 → 配 Chrome(如需 real 模式)→ 验证 → 收尾
 ```
 
-**铁律:操作前先 snapshot,操作后确认。** 不要凭记忆或猜测操作页面元素。
+**铁律:每一步都验证再进入下一步。** 不要把所有配置写完才一起测——出问题很难定位。
 
 ---
 
-## 1. 工具速查
+## 1. 先摸清环境(别假设)
 
-| 工具 | 用途 | 关键参数 |
+动手前先问清/查清四件事:
+
+| 要搞清的 | 怎么查 | 为什么重要 |
 |---|---|---|
-| `browser_session` | 切换会话 | `profile`: `real`(默认,用你登录态)/ `isolated`(干净 profile) |
-| `browser_navigate` | 打开 URL | `url` |
-| `browser_snapshot` | 拿元素列表 + ref | `mode`: `viewport`(默认)/ `all` |
-| `browser_click` | 点击 | `ref`(首选)或 `role`+`name` |
-| `browser_type` | 输入 | `ref` 或 `role`+`name` + `text` |
-| `browser_eval` | 跑 JS 读页面状态 | `code`(表达式,非箭头函数) |
-| `browser_storage` | 读 cookie/storage | `type`: `cookies`/`localStorage`/`sessionStorage` |
-| `browser_console` | 读 console 日志 | `level`(可选) |
-| `browser_wait_human` | 验证码等需人工时 | `reason` |
-| `browser_screenshot` | 截图存盘(给自己/人看) | `fullPage` |
-| `browser_close` | 关会话 | — |
+| **用户用哪个 MCP client** | 直接问:Codex / Claude Desktop / Cursor / 其他? | 不同 client 配置文件路径和格式不同 |
+| **操作系统** | `uname -a`(Linux)/ 看路径风格(`C:\` = Windows) | Chrome 启动方式、配置路径、spawn 方式都不同 |
+| **Node.js ≥ 18?** | `node --version` | 硬性依赖,没有要先装 |
+| **Chrome 装了没** | Linux: `which google-chrome-stable`;Windows: 找 `chrome.exe` | `real` 模式和 `isolated` 模式都需要 |
 
----
-
-## 2. ref 定位:首选方式
-
-`snapshot` 返回形如:
-```
-- [ref=e1] link "Docs"
-- [ref=e2] searchbox "Search"
-- [ref=e3] button "Sign in"
-```
-
-然后:
-```
-type  { ref: "e2", text: "playwright" }
-click { ref: "e3" }
-```
-
-**为什么用 ref:**
-- 精确:ref 是 snapshot 那一刻绑定到具体 DOM 元素的(`data-agent-ref` 属性),不会误中同名元素。
-- 自带校验:ref 会用 `^e\d+$` 校验,并检查**恰好命中 1 个**。命中 0 个 → 页面变了,重新 snapshot;命中多个 → 快照内部错误,重新 snapshot。
-
-**ref 的生命周期(必须记住):**
-- ref **只在下一次 snapshot 之前有效**。每次 snapshot 会清除所有旧 ref 并重新编号。
-- **页面一旦变化(导航、点击触发的动态加载、AJAX 更新),立刻重新 snapshot**,不要复用旧 ref。
-- 跨 snapshot 用旧 ref → 你会点错元素或报"ref 失效"。
-
----
-
-## 3. role + name 回退:没有 ref 时
-
-当你没 snapshot、或不想 snapshot 时,可用:
-```
-click { role: "button", name: "Sign in" }
-type  { role: "textbox", name: "Email", text: "a@b.com" }
-```
-
-**role 用隐式 ARIA role,不是原生标签名:**
-| 看到的元素 | role |
-|---|---|
-| `<a href>` | `link` |
-| `<button>` / `<summary>` | `button` |
-| `<input type=text>` / `<textarea>` | `textbox` |
-| `<input type=search>` | `searchbox` |
-| `<input type=checkbox>` | `checkbox` |
-| `<input type=radio>` | `radio` |
-| `<select>` | `combobox` |
-
-⚠️ **role+name 是模糊匹配**(name 子串),同名多个元素时可能命中第一个非预期元素。**优先用 ref**;role+name 只在确实没有 ref 时用。
-
----
-
-## 4. mode:viewport vs all
-
-- **`mode=viewport`(默认)**:只返回当前视口内可见的元素。复杂页面能从 ~150 个降到 ~10 个,**省 ~90% token**、降低误选噪声。**默认就用这个,不要无脑 all。**
-- **`mode=all`**:返回页面全部可交互元素(含需滚动才能看到的)。当目标元素在视口外、或你要通览全页时用。
-
-**滚动到目标后再 snapshot** 是常见手法:目标进了视口,viewport 模式就能抓到它。
-
----
-
-## 5. 判断元素是否"可操作"
-
-`snapshot` 已经过滤掉这些**不可操作**的元素,所以**列表里出现的元素都能点/能输入**:
-- `display:none` / `visibility:hidden` / `opacity:0` / `0×0` 尺寸
-- 被父元素隐藏的
-- `aria-hidden="true"`
-
-如果你在 snapshot 里**没看到**你以为该有的元素,可能它当时隐藏着(如折叠菜单、未展开的下拉)。先点开触发它的元素,再 snapshot。
-
----
-
-## 6. 典型任务模板
-
-### 填表 + 提交
-```
-1. navigate { url: "https://example.com/login" }
-2. snapshot { }                          # 默认 viewport
-3. type  { ref: "<邮箱框 ref>", text: "user@example.com" }
-4. type  { ref: "<密码框 ref>", text: "..." }
-5. click { ref: "<提交按钮 ref>" }
-6. snapshot { }                          # 确认登录后页面 / 报错
-```
-
-### 搜索
-```
-1. navigate { url: "https://duckduckgo.com" }
-2. snapshot { }
-3. type  { ref: "<搜索框 ref>", text: "query" }
-4. click { ref: "<搜索按钮 ref>" }       # 或按回车:eval { code: "...press Enter" }
-5. 等结果加载后 snapshot
-```
-
-### 需要滚动找元素
-```
-1. snapshot { }                          # 先看视口内有没有
-2. 没有 → eval { code: "window.scrollBy(0, 800)" } 滚动
-3. snapshot { }                          # 再看
-```
-
-### 处理验证码
-```
-1. 操作到验证码步骤
-2. wait_human { reason: "请完成验证码" }  # 暂停,等用户在浏览器里搞定
-3. 用户回复后继续 snapshot
+```bash
+# 一条命令摸清 Linux 环境
+node --version; which google-chrome-stable || which google-chrome || echo "Chrome 未装"
 ```
 
 ---
 
-## 7. 失败处理
+## 2. 安装依赖
 
-| 现象 | 原因 | 处理 |
+```bash
+git clone https://github.com/q35888/agentic-browser-mcp.git
+cd agentic-browser-mcp
+npm install
+```
+
+验证安装成功:
+```bash
+node --check index.mjs && echo "✅ 代码 OK"
+ls node_modules/playwright >/dev/null 2>&1 && echo "✅ 依赖 OK"
+```
+
+**记下 `index.mjs` 的绝对路径**,配置里要用:
+```bash
+pwd              # 假设是 /home/user/agentic-browser-mcp
+# 则 index.mjs 路径 = /home/user/agentic-browser-mcp/index.mjs
+```
+
+---
+
+## 3. 写配置(按 client 分)
+
+### 3.1 Codex(`~/.codex/config.toml`)
+
+```toml
+[mcp_servers.agentic-browser]
+type = "stdio"
+command = "/usr/bin/node"
+args = [ "/绝对路径/agentic-browser-mcp/index.mjs" ]
+```
+
+> ⚠️ **用 cc-switch 管理 Codex 配置的用户注意**:config.toml 的 `[mcp_servers.*]` 段**真相来源是 cc-switch 的 SQLite db**(`~/.cc-switch/cc-switch.db` 的 `mcp_servers` 表)。直接改 config.toml 会被 cc-switch 切换 provider 时覆盖。正确做法:① 在 cc-switch GUI 里加(最稳);② 或停掉 cc-switch(`pkill -x cc-switch`)后用 python 改 db,再重启 cc-switch。
+
+### 3.2 Claude Desktop
+
+- **macOS**: `~/Library/Application Support/Claude/claude_desktop_config.json`
+- **Windows**: `%APPDATA%\Claude\claude_desktop_config.json`
+
+```json
+{
+  "mcpServers": {
+    "agentic-browser": {
+      "command": "node",
+      "args": ["/绝对路径/agentic-browser-mcp/index.mjs"]
+    }
+  }
+}
+```
+改完**完全重启 Claude Desktop**(不是刷新)。
+
+### 3.3 Cursor
+
+`Settings → MCP → Add MCP Server`,或编辑 `~/.cursor/mcp.json`:
+```json
+{
+  "mcpServers": {
+    "agentic-browser": {
+      "command": "node",
+      "args": ["/绝对路径/agentic-browser-mcp/index.mjs"]
+    }
+  }
+}
+```
+
+### 3.4 通用 stdio(任意 MCP client)
+
+只要 client 能 spawn 进程、走 stdin/stdout。本质:
+```bash
+node /绝对路径/agentic-browser-mcp/index.mjs
+```
+然后按标准 MCP 协议:`initialize` → `tools/list` → `tools/call`。
+
+### 3.5 HTTP 模式(长驻单实例,多 client 共享)
+
+先启动 server:
+```bash
+node /绝对路径/agentic-browser-mcp/index.mjs --transport http --port 9223
+```
+然后 client 向 `http://127.0.0.1:9223/mcp` POST MCP 请求。适合多个 client 共享同一个浏览器会话。
+
+---
+
+## 4. 配置 Chrome(`real` 模式需要)
+
+`real` 模式复用用户**已登录**的 Chrome(登录态、cookie、2FA),需要 Chrome 用 `--remote-debugging-port=9222` + 独立 `user-data-dir` 启动。
+
+### 4.1 写启动脚本
+
+**Linux:**
+```bash
+#!/usr/bin/env bash
+PROFILE="$HOME/.agentic-browser-chrome-profile"
+mkdir -p "$PROFILE"
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+export WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-0}"
+exec google-chrome-stable \
+  --remote-debugging-port=9222 \
+  --user-data-dir="$PROFILE" \
+  --ozone-platform=wayland \
+  "$@"
+```
+
+> `--ozone-platform=wayland` 在 Wayland 上从后台进程拉起 Chrome 时必需,否则报 `Missing X server / Authorization required`。X11 用户去掉该 flag,确保 `DISPLAY`/`XAUTHORITY` 已设。
+
+**Windows:**
+```powershell
+chrome.exe --remote-debugging-port=9222 --user-data-dir="$env:USERPROFILE\.agentic-browser-chrome-profile"
+```
+
+### 4.2 不想手动写?用内置自动拉起
+
+**好消息:server 本身会自动拉起 Chrome。** 9222 不通时,它会:
+- Linux: spawn `bash -c 'nohup ~/.pi/agent/start-agent-chrome.sh &'`
+- Windows: 直接 spawn `chrome.exe`
+
+所以用户即使不手动开 Chrome,server 也能自启。**自定义脚本路径**:改 `index.mjs` 里的 `CHROME_STARTER` 常量指向用户自己的脚本。
+
+---
+
+## 5. 验证配置(关键,别跳过)
+
+### 5.1 先单独跑 server,确认能启动
+```bash
+echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}' | \
+  timeout 5 node /绝对路径/agentic-browser-mcp/index.mjs 2>&1 | head
+```
+能看到 `result` 含 `serverInfo` = 启动成功。报错则按报错修(常见:依赖没装、node 版本低)。
+
+### 5.2 验证 tools/list(11 个工具)
+```bash
+# 接上一条,再发一条 tools/list(同 stdio 会话)
+# 或在 client 里确认 agentic-browser 出现在工具列表
+```
+应看到 `browser_session`、`browser_navigate`、`browser_snapshot` 等 11 个工具。
+
+### 5.3 真实调用一次(端到端)
+让 client 调:
+```
+browser_session { }              # 启 real 会话(自动拉起 Chrome)
+browser_navigate { url: "https://example.com" }
+browser_snapshot { }             # 应返回 - [ref=e1] ... 列表
+```
+snapshot 返回元素列表 = 配置完全成功。
+
+### 5.4 如果用 http 模式
+```bash
+# 启动
+node /绝对路径/agentic-browser-mcp/index.mjs --transport http --port 9223 &
+# 验证端口
+curl -s http://127.0.0.1:9223/mcp -X POST \
+  -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{}}}'
+```
+
+---
+
+## 6. 常见坑(配置失败先查这些)
+
+| 症状 | 原因 | 解法 |
 |---|---|---|
-| `ref=eN 未命中` | 页面变了,ref 失效 | 重新 snapshot,用新 ref |
-| `ref=eN 命中 N 个` | 快照内部错误(本不该发生) | 重新 snapshot;持续则提 issue |
-| `fill: Timeout … not visible` | 元素隐藏/被遮挡 | 重新 snapshot 确认它在列表里;可能要先滚动/展开 |
-| `ECONNREFUSED 9222` | Chrome 没开 | server 会自动拉起;仍失败则提示用户手动开 Chrome |
-| 点击后没反应 | 异步加载/需要等待 | `eval` 轮询等待,或 sleep 后 snapshot |
+| client 报 `connection closed` / 连不上 | 配置路径写错、node 找不到 | 用绝对路径;`command` 用 `/usr/bin/node` 全路径;手动跑一遍 server 确认能启 |
+| Codex 配置改了不生效 / 切 provider 后没了 | cc-switch 从 db 覆盖 config.toml | 在 cc-switch GUI 加,或停掉 cc-switch 改 db |
+| server 报 `ECONNREFUSED 127.0.0.1:9222` | Chrome 没开 | server 会自动拉起;仍失败提示用户手动开;**别用 fetch 探测**(会被 http_proxy 劫持) |
+| Chrome 启动报 `Missing X server` | Wayland 下没指定平台 | 启动脚本加 `--ozone-platform=wayland` |
+| 9222 探测明明开着却误报不通 | `http_proxy` 环境变量让 fetch 把 localhost 发给代理 | server 用 `node:net` TCP 探测避开;别自己加 fetch 探测 |
+| `CSS is not defined` | Node 端用了浏览器全局 | 只在 `page.evaluate()` 里用 CSS/document |
+| 依赖装不上 | 网络问题 | 挂代理:`npm config set proxy http://127.0.0.1:7897` |
+| Windows 下 Chrome 起不来 | `detached:true` spawn 在某些环境失效 | 用 `chrome.exe` 直接 spawn |
 
 ---
 
-## 8. 辅助利器:`browser_eval`
+## 7. 收尾检查清单
 
-`eval` 跑在**浏览器里**,能用 `document`/`CSS`/`fetch` 等。适合:
-- 读页面状态:`eval { code: "document.title" }`、`location.href`
-- 滚动:`window.scrollBy(0, 500)`
-- 等待条件:`JSON.stringify({ready: document.querySelector('#result') !== null})`
-- 读数据:`JSON.stringify([...document.querySelectorAll('.item')].map(e=>e.textContent))`
+配置完逐项确认:
+- [ ] `node --version` ≥ 18
+- [ ] `npm install` 成功,`node_modules/playwright` 存在
+- [ ] `index.mjs` 绝对路径已填进配置(不是相对路径)
+- [ ] client 里能看到 11 个 browser_* 工具
+- [ ] 调 `browser_session` 能启会话(Chrome 自动拉起或已开)
+- [ ] 调 `browser_navigate` + `browser_snapshot` 能返回元素列表
+- [ ] **`real` 模式用户的登录态保留**(登录了某个站,navigate 过去还是登录态)
 
-⚠️ eval 里**别做破坏性操作**(删数据、提交表单),除非任务明确要求。优先用 click/type 这种可观测的操作。
-
----
-
-## 9. 禁忌(别这么做)
-
-- ❌ **跨 snapshot 用旧 ref** —— 会点错或失效。页面变了立刻重新 snapshot。
-- ❌ **无脑 `mode=all`** —— 浪费 token、增加误选。默认 viewport,需要时才 all。
-- ❌ **不 snapshot 就瞎点** —— 容易点错元素。先看清楚再操作。
-- ❌ **操作后不确认** —— 点完/输完要 snapshot 或 eval 确认结果,别假设成功。
-- ❌ **一次做太多步不检查** —— 复杂任务分阶段,每阶段 snapshot 确认。
-- ❌ **在 eval 里硬编码 CSS selector 做主要操作** —— 易碎。主要操作用 ref。
+全绿 = 配置完成,告诉用户可以用了。
 
 ---
 
-## 10. 检查清单(每次任务前)
+## 8. 给用户的一句话说明(配置完发给他)
 
-- [ ] 目标元素在最近的 snapshot 里吗?不在就先操作让它出现(展开/滚动),再 snapshot。
-- [ ] 我用的 ref 是当前这次 snapshot 的吗?(不是上次的)
-- [ ] 操作完我会 snapshot/eval 确认吗?
-- [ ] 这个页面需要登录态吗?需要则用 `real` 模式(已登录的 Chrome),别用 `isolated`。
-
-按这套来,你就能稳、准、省地完成绝大多数浏览器任务。
+> 已配置好 agentic-browser-mCP。`real` 模式会复用你登录过的 Chrome(登录态都保留),9222 没开它会自动拉起。下次 client 启动就能用 `browser_snapshot`(看页面元素)+ `browser_click`/`browser_type`(ref 操作)等 11 个浏览器工具。

@@ -56,6 +56,8 @@ const CHROME_BOOT_TIMEOUT_MS = 20000; // 自动拉起 Chrome 的最长等待
 
 let current = null;
 let chain = Promise.resolve();
+// 上次告知 AI 的标签页数(检测新增 tab 并提示,防 real 模式 tab 无限堆积)
+let lastTabCount = 0;
 function serialize(fn) {
   const run = chain.then(fn, fn); // 无论上一次成败都继续
   chain = run.catch(() => {});
@@ -146,6 +148,26 @@ function attachConsoleListener(s) {
   } catch {
     /* ignore */
   }
+}
+
+// 同步当前 tab 数到 lastTabCount(建/切会话时调,建立基准避免误报)
+function syncTabCount() {
+  try { lastTabCount = current?.context?.pages?.()?.length ?? 0; } catch { lastTabCount = 0; }
+}
+
+// 工具返回前调:tab 数比上次多则返回追加提示串,否则同步计数后返回空串
+function tabHint() {
+  try {
+    const n = current?.context?.pages?.()?.length ?? 0;
+    if (n > lastTabCount) {
+      const added = n - lastTabCount;
+      lastTabCount = n;
+      const tip = n >= 6 ? "（标签页偏多,可用 browser_eval 执行 close() 关闭多余的）" : "";
+      return `\n\n📌 新增 ${added} 个标签页,当前共打开 ${n} 个${tip}。`;
+    }
+    lastTabCount = n; // 关 tab 也同步,避免下次误报
+    return "";
+  } catch { return ""; }
 }
 
 function sameProfile(s, profile, incognito) {
@@ -244,6 +266,7 @@ async function ensureSession(opts = {}) {
     current = s;
     return s;
   });
+  syncTabCount();
 }
 
 function tryUrl(page) {
@@ -284,7 +307,7 @@ function createServer() {
   const server = new McpServer({ name: "agentic-browser-mcp", version: "0.1.0" });
 
   // content helpers —— 错误用 isError:true,让 MCP client(Codex)正确识别失败
-  const ok = (t) => ({ content: [{ type: "text", text: t }] });
+  const ok = (t) => ({ content: [{ type: "text", text: t + tabHint() }] });
   const err = (prefix, e) => ({
     content: [{ type: "text", text: `${prefix}: ${e?.message ?? e}` }],
     isError: true,
@@ -586,6 +609,7 @@ function createServer() {
         current = null;
       }
     });
+    lastTabCount = 0;
     return ok(`已关闭 ${was} 会话,资源已释放`);
   });
 
@@ -663,9 +687,18 @@ async function runHttp(port) {
       res.writeHead(405, { "content-type": "application/json" }).end(JSON.stringify({ jsonrpc: "2.0", error: { code: -32000, message: "Method not allowed (stateless: POST only)" }, id: null }));
       return;
     }
-    // 读 body
+    // 读 body(限制 8MB,防超大 POST 导致 OOM)
+    const MAX_BODY = 8 * 1024 * 1024;
     const chunks = [];
-    for await (const c of req) chunks.push(c);
+    let bodyLen = 0;
+    for await (const c of req) {
+      bodyLen += c.length;
+      if (bodyLen > MAX_BODY) {
+        res.writeHead(413, { "content-type": "application/json" }).end(JSON.stringify({ jsonrpc: "2.0", error: { code: -32700, message: "Request body too large (max 8MB)" }, id: null }));
+        return;
+      }
+      chunks.push(c);
+    }
     let body;
     try {
       body = JSON.parse(Buffer.concat(chunks).toString("utf8"));

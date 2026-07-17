@@ -2,9 +2,7 @@
 
 **English** | [中文](./README.zh-CN.md)
 
-A standalone **MCP server** that gives any MCP client (Codex, Claude, etc.) browser automation via **Playwright**. Drive a real, already-logged-in Chrome through the Chrome DevTools Protocol — share cookies and sessions across agents.
-
-Originally extracted from the [pi coding agent](https://pi.dev)'s browser extension, now a standalone server so **Codex / pi / any MCP client** can all use the same browser.
+A standalone **MCP server** that gives any MCP client (Codex, Claude, Grok, Cursor, …) browser automation on top of **Playwright**. Drive a real, already-logged-in Chrome through the Chrome DevTools Protocol — share cookies and sessions across agents. The goal: **every MCP client you use drives the same browser**, with the login state intact.
 
 ## Features
 
@@ -74,6 +72,17 @@ exec google-chrome-stable \
 
 If you don't start Chrome manually, the server will try to launch `$HOME/.pi/agent/start-agent-chrome.sh` automatically (override `CHROME_STARTER` in `index.mjs` to point at your own script).
 
+### Reusing your daily browser's login state
+
+Chrome 136+ **silently ignores `--remote-debugging-port` on the default profile** (security hardening against infostealers), so the dedicated Chrome must use a separate `user-data-dir` and starts with no logins. To make it **carry all the logins from your daily Chrome** (Gmail, GitHub, internal SaaS, …), run the sync script:
+
+```bash
+# With the dedicated Chrome stopped (and daily Chrome idle or closed):
+./scripts/sync-profile.sh
+```
+
+It copies `Cookies` / `Login Data` / `Web Data` / `Local State` from your default profile into the dedicated one — on Linux, the GNOME keyring key is shared per-user, so encrypted cookies decrypt transparently. Re-run it whenever you log in to a new site in your daily Chrome. See [`docs/agent-guide.md`](./docs/agent-guide.md), section "Reuse your daily logins", for details.
+
 ## Tools
 
 | Tool | Description |
@@ -126,6 +135,8 @@ type    { ref: "e2", text: "playwright" }
 ## Notes
 
 📖 **Helping a user set up this MCP?** Read [`docs/agent-guide.md`](./docs/agent-guide.md) — environment discovery, install, per-client config (Codex/Claude Desktop/Cursor), Chrome setup, verification, and common pitfalls.
+
+🆚 **How does this compare to the official `@playwright/mcp`?** See [`docs/vs-playwright-mcp.md`](./docs/vs-playwright-mcp.md) — same Playwright underneath, different trade-offs (login-state reuse, token-efficient snapshots, auto-launched Chrome, Chinese-first tool descriptions).
 
 - **`browser_wait_human`**: this server has no GUI/TUI. It returns a text prompt; the client agent is expected to surface it and wait for the user to reply.
 - **Session sharing**: multiple MCP clients connecting to the same server share one Playwright session (and thus one Chrome). Tool calls are serialized to prevent races.

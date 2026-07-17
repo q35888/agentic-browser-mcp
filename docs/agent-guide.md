@@ -141,6 +141,33 @@ exec google-chrome-stable \
 chrome.exe --remote-debugging-port=9222 --user-data-dir="$env:USERPROFILE\.agentic-browser-chrome-profile"
 ```
 
+### 4.3 复用日常浏览器的登录态(重要,Chrome 136+)
+
+**坑点**:Chrome 136+ 出于安全考虑(防 infostealer 盗 cookie),**禁止默认 profile 开 `--remote-debugging-port`**。你直接让日常 Chrome 加这个 flag,端口不会监听——命令行不会报错,但连不上。
+
+所以专用 Chrome 必须用独立 `user-data-dir`,默认带的是空登录态。但这违背了"real 模式"的初衷:用户要的是 agent 能操作自己**已经登录**的那些站。
+
+**解决方案**:用项目自带的 `scripts/sync-profile.sh`,把日常 profile 的认证文件拷贝到专用 profile。
+
+```bash
+# 1. 确认专用 Chrome 没在跑(脚本会自动 kill 占 9222 的进程)
+# 2. 强烈建议先关闭日常 Chrome(否则 cookie 可能不是最新写盘的)
+# 3. 在项目根目录运行:
+./scripts/sync-profile.sh
+```
+
+脚本做的事:
+- 自动 kill 占 9222 端口的 Chrome
+- 拷贝 `Cookies` / `Login Data` / `Login Data For Account` / `Web Data` / `Local State`
+- 清理 `SingletonLock` 等锁文件
+- 备份目标 profile 原文件到 `<专用 profile>/.sync-backup/<时间戳>/`
+
+**为什么 Linux 上能直接解密**:Chrome 在 Linux 用 GNOME keyring 存 cookie 加密 key,key 绑定**用户 session** 而非 profile 路径。同一用户跑的两个 profile 共享同一把 key,所以 cookie 文件直接拷过去就能解密。macOS Keychain 同理。Windows DPAPI 绑定用户,也能用。
+
+**首次配置后**:专用 Chrome 拉起时已带上日常浏览器的所有登录态(Gmail、GitHub、SaaS 后台等)。以后日常 Chrome 新登录了站,**再跑一次 `sync-profile.sh` 同步即可**。
+
+---
+
 ### 4.2 不想手动写?用内置自动拉起
 
 **好消息:server 本身会自动拉起 Chrome。** 9222 不通时,它会:
@@ -192,6 +219,7 @@ curl -s http://127.0.0.1:9223/mcp -X POST \
 
 | 症状 | 原因 | 解法 |
 |---|---|---|
+| Chrome 启动了但 9222 连不上 / 端口不监听 | Chrome 136+ 安全限制:默认 profile 下 `--remote-debugging-port` 被静默忽略 | 必须用独立 `--user-data-dir`;若要复用日常登录,跑 `./scripts/sync-profile.sh` |
 | client 报 `connection closed` / 连不上 | 配置路径写错、node 找不到 | 用绝对路径;`command` 用 `/usr/bin/node` 全路径;手动跑一遍 server 确认能启 |
 | Codex 配置改了不生效 / 切 provider 后没了 | cc-switch 从 db 覆盖 config.toml | 在 cc-switch GUI 加,或停掉 cc-switch 改 db |
 | server 报 `ECONNREFUSED 127.0.0.1:9222` | Chrome 没开 | server 会自动拉起;仍失败提示用户手动开;**别用 fetch 探测**(会被 http_proxy 劫持) |

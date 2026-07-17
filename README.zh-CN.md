@@ -2,9 +2,7 @@
 
 [English](./README.md) | **中文**
 
-一个独立的 **MCP server**,让任意 MCP client(Codex、Claude 等)通过 **Playwright** 拥有浏览器自动化能力。通过 Chrome DevTools Protocol 驱动一个真实的、**已登录**的 Chrome——在多个 agent 之间共享 cookie 和会话。
-
-最初从 [pi coding agent](https://pi.dev) 的浏览器扩展中抽取,现在做成独立 server,让 **Codex / pi / 任意 MCP client** 都能用同一个浏览器。
+一个独立的 **MCP server**，让任意 MCP client（Codex、Claude、Grok、Cursor 等）通过 **Playwright** 拥有浏览器自动化能力。通过 Chrome DevTools Protocol 驱动一个真实的、**已登录**的 Chrome——在多个 agent 之间共享 cookie 和会话。目标：**让你用的每一个 MCP client 都能驱动同一个浏览器**，登录态原封不动。
 
 ## 特性
 
@@ -74,6 +72,17 @@ exec google-chrome-stable \
 
 如果你不手动启动 Chrome,server 会尝试自动拉起 `$HOME/.pi/agent/start-agent-chrome.sh`(在 `index.mjs` 里改 `CHROME_STARTER` 指向你的脚本)。
 
+### 复用日常浏览器的登录态
+
+Chrome 136+ 出于安全考虑,**禁止默认 profile 开 `--remote-debugging-port`**,所以专用 Chrome 必须用独立 `user-data-dir`,默认不带任何登录态。要让专用 Chrome **直接用你日常 Chrome 的所有登录**(Gmail、GitHub、L 站、SaaS 后台……),跑一次同步脚本:
+
+```bash
+# 关掉专用 Chrome 和日常 Chrome(或确保它没在写 cookie),然后:
+./scripts/sync-profile.sh
+```
+
+它会把日常 profile 的 `Cookies` / `Login Data` / `Web Data` / `Local State` 拷贝到专用 profile——Linux 同用户 GNOME keyring 共享加密 key,cookie 可直接解密。以后日常 Chrome 里新登录了站,再跑一次同步即可。详见 [`docs/agent-guide.md`](./docs/agent-guide.md) 的「复用日常登录态」一节。
+
 ## 工具一览
 
 | 工具 | 说明 |
@@ -128,6 +137,10 @@ type    { ref: "e2", text: "playwright" }
 帮用户把这个 MCP 配置到各种 client(Codex / Claude Desktop / Cursor 等)的 AI agent,请阅读 [`docs/agent-guide.md`](./docs/agent-guide.md)——摸清环境、装依赖、写配置、验证、踩坑全覆盖。
 
 ## 备注
+
+📖 **帮用户配置这个 MCP？** 读 [`docs/agent-guide.md`](./docs/agent-guide.md)——摸清环境、装依赖、写配置、验证、踩坑全覆盖。
+
+🆚 **和官方 `@playwright/mcp` 比怎么样？** 看 [`docs/vs-playwright-mcp.md`](./docs/vs-playwright-mcp.md)——底层都是 Playwright，取舍不同（登录态复用、省 token 快照、Chrome 自动拉起、工具描述中文优先）。
 
 - **`browser_wait_human`**:本 server 无 GUI/TUI。它返回一个文本提示;client agent 应将其呈现给用户并等待回复。
 - **会话共享**:多个 MCP client 连同一个 server 时共享同一个 Playwright 会话(即同一个 Chrome)。工具调用串行化以防竞态。

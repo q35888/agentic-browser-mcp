@@ -33,6 +33,7 @@
 | `AGENT_BROWSER_CDP_PROFILE` | `<AGENT_BROWSER_DIR>/chrome-cdp-profile` | CDP 模式 profile 目录 |
 | `AGENT_BROWSER_ISOLATED_PROFILE` | `<AGENT_BROWSER_DIR>/bw-mcp-profile` | isolated 模式 profile 目录 |
 | `AGENT_BROWSER_LOG_FILE` | `os.tmpdir()/agentic-browser-mcp-chrome.log` | Chrome 启动日志路径 |
+| `AGENT_BROWSER_CDP_PORT` | `9222` | Chrome DevTools Protocol 端口 |
 
 覆盖示例:
 
@@ -84,10 +85,8 @@ Chrome 150+ 做远程调试需要非默认的 user-data-dir。示例启动脚本
 
 ```bash
 #!/usr/bin/env bash
-# ⚠️ 示例 profile 路径,请根据实际部署调整:
-#    - 默认示例:  $HOME/.agentic-browser-chrome-profile(全新无登录态)
-#    - Pi 环境:    /tmp/chrome-outlook-profile(由 ~/.pi/agent/start-agent-chrome.sh 指定)
-#    - Pi 带登录态: $HOME/.pi/agent/chrome-cdp-profile(已通过 sync-profile.sh 同步)
+# ⚠️ profile 路径由 AGENT_BROWSER_CDP_PROFILE 决定(默认 $HOME/.pi/agent/chrome-cdp-profile)。
+# 没有登录态? 跑一次 sync-profile.sh 从日常 Chrome 同步登录态。
 # 判断某个 profile 是否带目标站点登录态:
 #    strings <profile>/Default/Cookies | grep -i <domain>   # 有命中说明带 cookie
 PROFILE="$HOME/.agentic-browser-chrome-profile"
@@ -104,7 +103,7 @@ exec google-chrome-stable \
 
 > 从后台进程 spawn Chrome 时,`--ozone-platform=wayland` 很关键:否则 Chrome 的平台启发式会选 X11,报 `Missing X server / Authorization required` 失败。按你的显示服务器调整(X11 用户:去掉该 flag,确保 `DISPLAY`/`XAUTHORITY` 已设)。
 
-如果你不手动启动 Chrome,server 会尝试自动拉起 `$HOME/.pi/agent/start-agent-chrome.sh`(在 `index.mjs` 里改 `CHROME_STARTER` 指向你的脚本)。
+如果你不手动启动 Chrome,server 会自动拉起:优先用 `AGENT_BROWSER_CHROME_STARTER` 脚本(默认 `$HOME/.pi/agent/start-agent-chrome.sh`),**脚本不存在则内置直接 spawn chrome**(跨平台查找可执行文件,换机零依赖)。自定义启动方式:设 `AGENT_BROWSER_CHROME_STARTER` 指向你的脚本。
 
 ### 复用日常浏览器的登录态
 
@@ -188,7 +187,7 @@ type    { ref: "e2", text: "playwright" }
 
 ## 故障排查
 
-- **`ECONNREFUSED 127.0.0.1:9222` / Chrome 没开** —— `real` 模式下,server 用 `node:http.get /json/version`(`agent:false` 显式不走 `http_proxy`/`https_proxy`,避免 localhost 探测被发到 HTTP 代理)探测 9222 的 DevTools HTTP 服务。**只验 TCP 端口不够**——chrome 启动时序是 先开 TCP → 再起 DevTools HTTP → 再能响应 `/json/version`,只验 TCP 会造成时序竞态(TCP 通但 `connectOverCDP` 立即抛错)。所以必须等 `/json/version` 返回 200。探测不通则自动 spawn `$CHROME_STARTER`(路径见错误消息,默认 `~/.pi/agent/start-agent-chrome.sh`)并轮询最多 20s。Linux 下用 `bash -c 'nohup … &'`(本环境下 `spawn(…, {detached:true})` 起不来 Chrome);Windows 下直接 spawn `chrome.exe`。自动拉起仍失败,就用手动脚本启动。
+- **`ECONNREFUSED 127.0.0.1:9222` / Chrome 没开** —— `real` 模式下,server 用 `node:http.get /json/version`(`agent:false` 显式不走 `http_proxy`/`https_proxy`,避免 localhost 探测被发到 HTTP 代理)探测 9222 的 DevTools HTTP 服务。**只验 TCP 端口不够**——chrome 启动时序是 先开 TCP → 再起 DevTools HTTP → 再能响应 `/json/version`,只验 TCP 会造成时序竞态(TCP 通但 `connectOverCDP` 立即抛错)。所以必须等 `/json/version` 返回 200。探测不通则调 `spawnStarter()`:优先用 `AGENT_BROWSER_CHROME_STARTER` 脚本(存在才用),**不存在则内置直接 spawn chrome**——跨平台查找可执行文件(Linux `/usr/bin/google-chrome-stable` 等、Windows `Program Files`、macOS `/Applications/Google Chrome.app`),用 `detached:true` + `--remote-debugging-port=${CDP_PORT}` + `--user-data-dir=${CDP_PROFILE}` 启动。轮询最多 20s。自动拉起仍失败,就手动启动 Chrome。
 - **`fill: Timeout … element is not visible`** —— 你可能点/输入了一个隐藏元素(如 `0×0`/`opacity:0` 的装饰性控件)。重新 `snapshot`,可见性过滤器现在应能排除它。若确实可见的元素仍失败,可能是 ref 失效——重新 snapshot。
 - **`ref=eN 未命中`(ref 失效)** —— 上次 `snapshot` 后页面变了(导航、动态内容、元素被移除/重渲染)。重新 `snapshot`,用新 ref。
 - **`ref=eN 命中 N 个`(ref 重复)** —— 快照内部错误(ref 本应唯一)。重新 snapshot;若持续出现,提 issue。

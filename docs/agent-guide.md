@@ -170,11 +170,11 @@ chrome.exe --remote-debugging-port=9222 --user-data-dir="$env:USERPROFILE\.agent
 
 ### 4.2 不想手动写?用内置自动拉起
 
-**好消息:server 本身会自动拉起 Chrome。** 9222 不通时,它会:
-- Linux: spawn `bash -c 'nohup ~/.pi/agent/start-agent-chrome.sh &'`
-- Windows: 直接 spawn `chrome.exe`
+**好消息:server 本身会自动拉起 Chrome。** CDP 端口(默认 9222)不通时,spawnStarter 会按优先级尝试:
+1. 如果 `AGENT_BROWSER_CHROME_STARTER` 脚本(或默认 `~/.pi/agent/start-agent-chrome.sh`)存在 → 用它(兼容 Pi 环境/自定义脚本)
+2. 否则内置直接 spawn chrome —— 跨平台查找 chrome 可执行文件(Linux `/usr/bin/google-chrome-stable`、Windows `Program Files`、macOS `/Applications/Google Chrome.app`),用 `--remote-debugging-port` + `--user-data-dir=$CDP_PROFILE` 启动,**不依赖任何外部脚本,换机即可用**
 
-所以用户即使不手动开 Chrome,server 也能自启。**自定义脚本路径**:改 `index.mjs` 里的 `CHROME_STARTER` 常量指向用户自己的脚本。
+所以用户即使不手动开 Chrome、也没有 `start-agent-chrome.sh`,server 也能自启。**自定义启动方式**:设环境变量 `AGENT_BROWSER_CHROME_STARTER` 指向自己的脚本。
 
 ---
 
@@ -224,7 +224,7 @@ curl -s http://127.0.0.1:9223/mcp -X POST \
 | Codex 配置改了不生效 / 切 provider 后没了 | cc-switch 从 db 覆盖 config.toml | 在 cc-switch GUI 加,或停掉 cc-switch 改 db |
 | server 报 `ECONNREFUSED 127.0.0.1:9222` | Chrome 没开 | server 会自动拉起;仍失败提示用户手动开;**别用 fetch 探测**(会被 http_proxy 劫持) |
 | Chrome 启动报 `Missing X server` | Wayland 下没指定平台 | 启动脚本加 `--ozone-platform=wayland` |
-| 9222 探测明明开着却误报不通 | `http_proxy` 环境变量让 fetch 把 localhost 发给代理 | server 用 `node:net` TCP 探测避开;别自己加 fetch 探测 |
+| 9222 探测明明开着却误报不通 | `http_proxy` 环境变量让 fetch 把 localhost 发给代理 | server 用 `node:http` + `agent:false` 探测 `/json/version`,显式不走代理;别换成裸 fetch |
 | `CSS is not defined` | Node 端用了浏览器全局 | 只在 `page.evaluate()` 里用 CSS/document |
 | 依赖装不上 | 网络问题 | 挂代理:`npm config set proxy http://127.0.0.1:7897` |
 | Windows 下 Chrome 起不来 | `detached:true` spawn 在某些环境失效 | 用 `chrome.exe` 直接 spawn |

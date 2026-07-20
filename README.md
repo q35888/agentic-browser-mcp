@@ -31,6 +31,7 @@ All paths go through env vars with defaults that fall back to the Pi env layout.
 | `AGENT_BROWSER_CDP_PROFILE` | `<AGENT_BROWSER_DIR>/chrome-cdp-profile` | CDP-mode profile dir |
 | `AGENT_BROWSER_ISOLATED_PROFILE` | `<AGENT_BROWSER_DIR>/bw-mcp-profile` | Isolated-mode profile dir |
 | `AGENT_BROWSER_LOG_FILE` | `os.tmpdir()/agentic-browser-mcp-chrome.log` | Chrome startup log |
+| `AGENT_BROWSER_CDP_PORT` | `9222` | Chrome DevTools Protocol port |
 
 Override examples:
 
@@ -82,10 +83,8 @@ Chrome 150+ requires a non-default user-data-dir for remote debugging. Example s
 
 ```bash
 #!/usr/bin/env bash
-# ⚠️ Example profile path — adjust to your deployment:
-#    - Default example: $HOME/.agentic-browser-chrome-profile (fresh, no logins)
-#    - Pi env:          /tmp/chrome-outlook-profile (from ~/.pi/agent/start-agent-chrome.sh)
-#    - Pi with logins:  $HOME/.pi/agent/chrome-cdp-profile (synced via sync-profile.sh)
+# ⚠️ Profile path is controlled by AGENT_BROWSER_CDP_PROFILE (default: $HOME/.pi/agent/chrome-cdp-profile).
+# No logins? Run sync-profile.sh once to copy them from your daily Chrome.
 # Check if a profile has a site's login:
 #    strings <profile>/Default/Cookies | grep -i <domain>   # hits = cookies present
 PROFILE="$HOME/.agentic-browser-chrome-profile"
@@ -102,7 +101,7 @@ exec google-chrome-stable \
 
 > `--ozone-platform=wayland` is important when Chrome is spawned from a background process: otherwise Chrome's platform heuristic picks X11 and fails with `Missing X server / Authorization required`. Adjust for your display server (X11 users: drop the flag and ensure `DISPLAY`/`XAUTHORITY` are set).
 
-If you don't start Chrome manually, the server will try to launch `$HOME/.pi/agent/start-agent-chrome.sh` automatically (override `CHROME_STARTER` in `index.mjs` to point at your own script).
+If you don't start Chrome manually, the server auto-launches: first tries the `AGENT_BROWSER_CHROME_STARTER` script (default `$HOME/.pi/agent/start-agent-chrome.sh`); **if absent, falls back to a builtin direct spawn** (cross-platform chrome lookup, zero external deps). To customize, set `AGENT_BROWSER_CHROME_STARTER` to your own script.
 
 ### Reusing your daily browser's login state
 
@@ -182,7 +181,7 @@ type    { ref: "e2", text: "playwright" }
 
 ## Troubleshooting
 
-- **`ECONNREFUSED 127.0.0.1:9222` / Chrome not running** — In `real` mode the server probes 9222 via `node:http.get /json/version` (`agent:false` explicitly bypasses `http_proxy`/`https_proxy`, avoiding false "port closed" when your proxy would intercept the localhost probe). **Probing TCP alone is not enough** — Chrome startup order is TCP first → then DevTools HTTP → then `/json/version` responds; checking only TCP causes a race (TCP up but `connectOverCDP` immediately throws). So it waits for `/json/version` 200. If closed, it auto-spawns `$CHROME_STARTER` (path appears in the error message; default `~/.pi/agent/start-agent-chrome.sh`) and polls for up to 20s. On Linux it uses `bash -c 'nohup … &'` (in this env `spawn(…, {detached:true})` can't start Chrome); on Windows it directly spawns `chrome.exe`. If auto-start still fails, launch manually.
+- **`ECONNREFUSED 127.0.0.1:9222` / Chrome not running** — In `real` mode the server probes 9222 via `node:http.get /json/version` (`agent:false` explicitly bypasses `http_proxy`/`https_proxy`, avoiding false "port closed" when your proxy would intercept the localhost probe). **Probing TCP alone is not enough** — Chrome startup order is TCP first → then DevTools HTTP → then `/json/version` responds; checking only TCP causes a race (TCP up but `connectOverCDP` immediately throws). So it waits for `/json/version` 200. If closed, it calls `spawnStarter()`: tries the `AGENT_BROWSER_CHROME_STARTER` script first (if it exists); **otherwise builtin-direct-spawns chrome** — cross-platform executable lookup (Linux `/usr/bin/google-chrome-stable` etc, Windows `Program Files`, macOS `/Applications/Google Chrome.app`), using `detached:true` + `--remote-debugging-port=${CDP_PORT}` + `--user-data-dir=${CDP_PROFILE}`. Polls for up to 20s. If auto-start still fails, launch Chrome manually.
 - **`fill: Timeout … element is not visible`** — You likely clicked/typed a hidden element (e.g. a `0×0`/`opacity:0` decorative control). Re-run `snapshot`; the visibility filter should now exclude it. If a genuinely visible element still fails, its ref may be stale — re-snapshot.
 - **`ref=eN 未命中` (stale ref)** — The page changed since the last `snapshot` (navigation, dynamic content, element removed/re-rendered). Re-run `snapshot` and use the new ref.
 - **`ref=eN 命中 N 个` (duplicate ref)** — A snapshot-internal error (refs should be unique). Re-snapshot; if it persists, file an issue.

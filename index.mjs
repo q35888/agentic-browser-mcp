@@ -2,7 +2,7 @@
 /**
  * agentic-browser-mcp — Pi 浏览器能力的独立 MCP server。
  *
- * 逻辑与 pi 扩展的 browser-tool.ts 对齐(单一行为基准,原路径 ~/.pi/agent/extensions/),
+ * 逻辑与 pi 扩展的 browser-tool.ts 对齐(单一行为基准),
  * 但脱离 pi 进程,以 MCP server 形式供 Codex / pi / 任意 MCP client 连接。
  *
  * 后端:Playwright 1.61
@@ -39,7 +39,8 @@ import * as http from "node:http";
 //                  AGENT_BROWSER_ISOLATED_PROFILE / AGENT_BROWSER_LOG_FILE
 const AGENT_DIR = process.env.AGENT_BROWSER_DIR ?? join(os.homedir(), ".pi", "agent");
 const ISOLATED_PROFILE = process.env.AGENT_BROWSER_ISOLATED_PROFILE ?? join(AGENT_DIR, "bw-mcp-profile");
-const CDP_ENDPOINT = "http://127.0.0.1:9222";
+const CDP_PORT = parseInt(process.env.AGENT_BROWSER_CDP_PORT ?? "9222", 10);
+const CDP_ENDPOINT = `http://127.0.0.1:${CDP_PORT}`;
 const CHROME_STARTER = process.env.AGENT_BROWSER_CHROME_STARTER ?? join(AGENT_DIR, "start-agent-chrome.sh");
 
 // Windows: 自动查找系统 Chrome，CDP 模式专用 profile
@@ -83,8 +84,8 @@ function serialize(fn) {
 }
 
 // ===== 自动拉起专用 Chrome =====
-// real 模式需要 9222 在听;AI 不该要求用户手动开 Chrome。
-// 探测 9222,不通就 detached spawn start-agent-chrome.sh,轮询等待它起来。
+// real 模式需要 CDP_PORT 在听;AI 不该要求用户手动开 Chrome。
+// 探测 CDP_PORT,不通就 spawnStarter(优先用 CHROME_STARTER 脚本,不存在则内置 spawn chrome),轮询等待它起来。
 
 // 探测 9222 的 DevTools HTTP 服务是否就绪。
 // 必须 HTTP GET /json/version 拿到 200,而不是 TCP 连通——chrome 启动时序是
@@ -94,7 +95,7 @@ function serialize(fn) {
 function chromeUp() {
   return new Promise((resolve) => {
     const req = http.get(
-      { host: "127.0.0.1", port: 9222, path: "/json/version", agent: false },
+      { host: "127.0.0.1", port: CDP_PORT, path: "/json/version", agent: false },
       (res) => {
         res.resume();
         res.on("end", () => resolve(res.statusCode === 200));
@@ -137,7 +138,7 @@ function spawnStarter() {
   const exe = findChrome();
   if (!exe) return false;
   const args = [
-    `--remote-debugging-port=9222`,
+    `--remote-debugging-port=${CDP_PORT}`,
     `--user-data-dir=${CDP_PROFILE}`,
     "--no-first-run",
     "--no-default-browser-check",
@@ -288,11 +289,11 @@ async function ensureSession(opts = {}) {
 
     if (profile === "real") {
       // 自动拉起专用 Chrome(AI 不该要求用户手动开)。
-      // ensureChromeUp 探测 9222,不通就 spawn start-agent-chrome.sh 并轮询等待。
+      // ensureChromeUp 探测 CDP_PORT,不通就 spawnStarter(CHROME_STARTER 脚本或内置 spawn)并轮询等待。
       const up = await ensureChromeUp();
       if (!up) {
         throw new Error(
-          `专用 Chrome(9222)未启动且自动拉起失败。请手动执行 ${CHROME_STARTER}`,
+          `专用 Chrome(${CDP_PORT})未启动且自动拉起失败。请手动执行 ${CHROME_STARTER}(若脚本不存在,MCP 会内置直接 spawn chrome)`,
         );
       }
       const browser = await chromium.connectOverCDP(CDP_ENDPOINT);
@@ -417,7 +418,7 @@ function createServer() {
       return err(
         "浏览器会话失败",
         e,
-        `检查步骤: 1) curl http://127.0.0.1:9222/json/version 看是否返回 200; 2) 不通则手动执行 ${CHROME_STARTER}; 3) 若需特定登录态,检查 ${CHROME_STARTER} 脚本里的 --user-data-dir 指向哪个 profile,换成带登录态的; 4) 判断 profile 是否带某站登录: strings <profile>/Default/Cookies | grep -i <domain>; 5) Chrome 起来后重试 browser_session`,
+        `检查步骤: 1) curl http://127.0.0.1:${CDP_PORT}/json/version 看是否返回 200; 2) 不通则手动启动 Chrome: google-chrome-stable --remote-debugging-port=${CDP_PORT} --user-data-dir=${CDP_PROFILE}(--no-sandbox); 或设置 AGENT_BROWSER_CHROME_STARTER 指向自定义脚本; 3) 若需特定登录态,把 --user-data-dir 指向带登录态的 profile; 4) 判断 profile 是否带某站登录: strings <profile>/Default/Cookies | grep -i <domain>; 5) Chrome 起来后重试 browser_session`,
       );
     }
   });

@@ -45,9 +45,9 @@
 
 ### 2. Chrome 自动拉起——不劳烦用户
 
-`ensureChromeUp()` 探测 9222 不通时自动 spawn `~/.pi/agent/start-agent-chrome.sh`，轮询最多 20 秒等它起来。探测用 `node:net` 原始 TCP 连接而不是 `fetch`——避开 `http_proxy` 把 localhost 探测劫持到 HTTP 代理的坑（踩过的人才懂）。
+`ensureChromeUp()` 探测 CDP 端口（默认 9222）不通时调 `spawnStarter()`：优先用 `AGENT_BROWSER_CHROME_STARTER` 脚本（兼容 Pi 环境），不存在则**内置直接 spawn chrome**（跨平台查找可执行文件，换机零依赖），轮询最多 20 秒等它起来。
 
-Linux 用 `bash -c 'nohup … &'`（注释里写了为什么 `detached:true` 不行），Windows 直接 spawn `chrome.exe`。
+探测方式是 HTTP `GET /json/version`（不是裸 TCP —— 避免 chrome 启动时序竞态：TCP 先通、DevTools HTTP 还没起来）。用 `node:http` + `agent:false` 显式不走 `http_proxy`，避开代理把 localhost 探测劫持的坑。
 
 ### 3. 省 token 的 snapshot 设计
 

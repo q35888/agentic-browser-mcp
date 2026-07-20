@@ -9,7 +9,7 @@
 # 用法:
 #   1. 日常 Chrome 关闭(或至少保证没在写 Cookies);本脚本会尝试自动 SIGSTOP/继续
 #   2. agentic-browser 的专用 Chrome 关闭(脚本会先 kill 9222 端口的 chrome)
-#   3. 运行:~/.pi/agent/sync-profile.sh
+#   3. 运行:./scripts/sync-profile.sh  (或 bash sync-profile.sh)
 
 set -euo pipefail
 

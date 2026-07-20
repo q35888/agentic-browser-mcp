@@ -14,7 +14,7 @@
 set -euo pipefail
 
 SRC_PROFILE="${HOME}/.config/google-chrome"
-DST_PROFILE="${TMPDIR:-/tmp}/chrome-outlook-profile"
+DST_PROFILE="${AGENT_BROWSER_CDP_PROFILE:-$HOME/.pi/agent/chrome-cdp-profile}"
 CHROME_BIN="${CHROME_BIN:-google-chrome-stable}"
 
 log() { echo "[sync-profile] $*"; }

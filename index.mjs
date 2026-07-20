@@ -52,6 +52,17 @@ const CHROME_CANDIDATES_WIN = [
   "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
   "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
 ];
+// Linux/macOS Chrome 候选路径
+const CHROME_CANDIDATES_UNIX = [
+  "/usr/bin/google-chrome-stable",
+  "/usr/bin/google-chrome",
+  "/usr/bin/chromium-browser",
+  "/usr/bin/chromium",
+  "/usr/local/bin/google-chrome-stable",
+  "/opt/google/chrome/chrome",
+  "/snap/bin/chromium",
+  "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+];
 const SNAPSHOT_MAX_CHARS = 12000;
 const SHUTDOWN_TIMEOUT_MS = 3000;
 const CHROME_BOOT_TIMEOUT_MS = 20000; // 自动拉起 Chrome 的最长等待
@@ -97,32 +108,52 @@ function chromeUp() {
   });
 }
 
+// 查找系统 Chrome 可执行文件
+function findChrome() {
+  const candidates = IS_WIN ? CHROME_CANDIDATES_WIN : CHROME_CANDIDATES_UNIX;
+  return candidates.find((p) => {
+    try { return existsSync(p); } catch { return false; }
+  });
+}
+
 function spawnStarter() {
-  // Windows: 直接 spawn chrome.exe（无 bash/nohup）
-  if (IS_WIN) {
+  // 优先级 1: 如果用户配置了 CHROME_STARTER 脚本且存在,用它(兼容 Pi 环境/自定义脚本)
+  if (CHROME_STARTER && existsSync(CHROME_STARTER)) {
     try {
-      const exe = CHROME_CANDIDATES_WIN.find((p) => existsSync(p));
-      if (!exe) return false;
       const child = spawn(
-        exe,
-        ["--remote-debugging-port=9222", `--user-data-dir=${CDP_PROFILE}`, "--no-first-run", "--no-default-browser-check"],
-        { stdio: "ignore", detached: true },
+        "bash",
+        ["-c", `nohup ${JSON.stringify(CHROME_STARTER)} > ${JSON.stringify(CHROME_LOG_FILE)} 2>&1 &`],
+        { stdio: "ignore" },
       );
       child.on("error", () => {});
       child.unref();
       return true;
     } catch {
-      return false;
+      /* fall through */
     }
   }
-  // 用 nohup + shell 后台(detached:true 在本环境下 Chrome 起不来)。
-  // bash -c "nohup ... &" 让 Chrome 脱离 node 进程独立长驻。
+
+  // 优先级 2: 内置直接 spawn chrome(不依赖外部脚本,换机即可用)
+  const exe = findChrome();
+  if (!exe) return false;
+  const args = [
+    `--remote-debugging-port=9222`,
+    `--user-data-dir=${CDP_PROFILE}`,
+    "--no-first-run",
+    "--no-default-browser-check",
+    "--disable-default-apps",
+    "--disable-popup-blocking",
+  ];
+  // Linux 无图形环境兜底(非 headless 模式也需要 DISPLAY)
+  if (!IS_WIN) {
+    args.push("--no-sandbox");
+  }
   try {
-    const child = spawn(
-      "bash",
-      ["-c", `nohup ${JSON.stringify(CHROME_STARTER)} > ${JSON.stringify(CHROME_LOG_FILE)} 2>&1 &`],
-      { stdio: "ignore" },
-    );
+    const child = spawn(exe, args, {
+      stdio: "ignore",
+      detached: true,            // 脱离 node 进程独立长驻
+      env: { ...process.env, DISPLAY: process.env.DISPLAY ?? ":0" },
+    });
     child.on("error", () => {});
     child.unref();
     return true;

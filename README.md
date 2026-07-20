@@ -20,6 +20,32 @@ A standalone **MCP server** that gives any MCP client (Codex, Claude, Grok, Curs
 - Playwright-compatible Chrome/Chromium installed (`google-chrome-stable` works)
 - For `real` mode: a Chrome instance running with `--remote-debugging-port=9222` and a dedicated `user-data-dir` (see [Start Chrome with CDP](#start-chrome-with-cdp))
 
+### Path configuration (env vars)
+
+All paths go through env vars with defaults that fall back to the Pi env layout. To deploy on a different device/path, set one or more env vars:
+
+| Env var | Default | Purpose |
+|---|---|---|
+| `AGENT_BROWSER_DIR` | `~/.pi/agent` | Root dir; other paths derive from this |
+| `AGENT_BROWSER_CHROME_STARTER` | `<AGENT_BROWSER_DIR>/start-agent-chrome.sh` | Chrome launch script |
+| `AGENT_BROWSER_CDP_PROFILE` | `<AGENT_BROWSER_DIR>/chrome-cdp-profile` | CDP-mode profile dir |
+| `AGENT_BROWSER_ISOLATED_PROFILE` | `<AGENT_BROWSER_DIR>/bw-mcp-profile` | Isolated-mode profile dir |
+| `AGENT_BROWSER_LOG_FILE` | `os.tmpdir()/agentic-browser-mcp-chrome.log` | Chrome startup log |
+
+Override examples:
+
+```bash
+# Change only the root (others follow)
+AGENT_BROWSER_DIR=/data/my-agent node index.mjs
+
+# Fine-grained control
+AGENT_BROWSER_CHROME_STARTER=/opt/chrome/launch.sh \
+AGENT_BROWSER_CDP_PROFILE=/opt/chrome/profiles/logged-in \
+node index.mjs
+```
+
+All paths in error messages and tool descriptions are dynamic — no hardcoded `~/.pi/agent`.
+
 ## Install
 
 ```bash
@@ -56,6 +82,12 @@ Chrome 150+ requires a non-default user-data-dir for remote debugging. Example s
 
 ```bash
 #!/usr/bin/env bash
+# ⚠️ Example profile path — adjust to your deployment:
+#    - Default example: $HOME/.agentic-browser-chrome-profile (fresh, no logins)
+#    - Pi env:          /tmp/chrome-outlook-profile (from ~/.pi/agent/start-agent-chrome.sh)
+#    - Pi with logins:  $HOME/.pi/agent/chrome-cdp-profile (synced via sync-profile.sh)
+# Check if a profile has a site's login:
+#    strings <profile>/Default/Cookies | grep -i <domain>   # hits = cookies present
 PROFILE="$HOME/.agentic-browser-chrome-profile"
 mkdir -p "$PROFILE"
 # Fill in graphics session env if spawning from a non-graphical context
@@ -88,13 +120,13 @@ It copies `Cookies` / `Login Data` / `Web Data` / `Local State` from your defaul
 | Tool | Description |
 |---|---|
 | `browser_session` | Start/switch a session (`real` / `isolated`, `headless`, `incognito`). No args = ensure default `real`. |
-| `browser_navigate` | Open a URL. |
-| `browser_snapshot` | List interactive elements with `ref` numbers, e.g. `- [ref=e3] button "Sign in"`. Default `mode=viewport` (in-viewport only, saves tokens); `mode=all` returns everything. Use `ref` for `click`/`type`. |
+| `browser_navigate` | Opens a URL. Passing `profile` explicitly only reconnects CDP when profile differs from current session (passing the default `"real"` no longer triggers a needless reconnect). |
+| `browser_snapshot` | Lists interactive elements with `ref` ids. Default `mode=viewport` (only in-viewport, saves tokens); `mode=all` returns all. **`refreshActivePage` runs before every tool call** — newly opened tabs (`<a target="_blank"`> / `window.open()`) are automatically followed. |
 | `browser_click` | Click by `ref` (preferred, e.g. `e3`) or `role` (+`name`). `ref` is validated (`^e\d+$`) and checked for exactly one match (0=stale, >1=duplicate → re-snapshot). |
 | `browser_type` | Fill an input by `ref` (preferred) or `role` (+`name`). Same ref validation as `click`. |
 | `browser_eval` | Run a JS expression in the page (read DOM/storage/fire requests). |
 | `browser_storage` | Read `cookies` / `localStorage` / `sessionStorage`. |
-| `browser_console` | Read buffered console logs (optional `level` filter). |
+| `browser_console` | Reads buffered console logs (optional `level` filter). Listener is bound on `context.on("page")`, so console logs from newly opened tabs are also collected. |
 | `browser_wait_human` | For CAPTCHAs/manual steps — returns a prompt; the calling agent pauses and waits for the user. |
 | `browser_screenshot` | Save a PNG to disk. |
 | `browser_close` | Close the current session (`real` only disconnects CDP, never kills your Chrome). |
@@ -134,6 +166,12 @@ type    { ref: "e2", text: "playwright" }
 
 ## Notes
 
+📌 **Multi-tab behavior** — Every tool call runs `refreshActivePage(s)` first, switching `s.page` to the last entry of `context.pages()`. This means:
+- ✅ `click <a target="_blank">`, `window.open()`, `browser_navigate` opening a new tab → subsequent operations auto-follow the new tab
+- ❌ **Manual tab switching in Chrome UI is NOT tracked** (Playwright CDP exposes no stable "focused tab" API)
+- ❌ Closing the last tab → falls back to the second-to-last; closing all tabs → error, rebuild via `browser_session`
+- Fallback: use `browser_eval` to call `chrome.tabs.update({active: true})`
+
 📖 **Helping a user set up this MCP?** Read [`docs/agent-guide.md`](./docs/agent-guide.md) — environment discovery, install, per-client config (Codex/Claude Desktop/Cursor), Chrome setup, verification, and common pitfalls.
 
 🆚 **How does this compare to the official `@playwright/mcp`?** See [`docs/vs-playwright-mcp.md`](./docs/vs-playwright-mcp.md) — same Playwright underneath, different trade-offs (login-state reuse, token-efficient snapshots, auto-launched Chrome, Chinese-first tool descriptions).
@@ -144,7 +182,7 @@ type    { ref: "e2", text: "playwright" }
 
 ## Troubleshooting
 
-- **`ECONNREFUSED 127.0.0.1:9222` / Chrome not running** — In `real` mode the server probes port 9222 via a raw TCP connection (`node:net`, **not** `fetch` — `fetch` honors `http_proxy`/`https_proxy` and would route the localhost probe to your HTTP proxy, falsely reporting the port down). If down, it auto-spawns `$CHROME_STARTER` (default `~/.pi/agent/start-agent-chrome.sh`) and polls for up to 20s. On Linux it uses `bash -c 'nohup … &'` (`spawn(…, {detached:true})` fails to start Chrome in this env); on Windows it spawns `chrome.exe` directly. If auto-launch still fails, start Chrome manually via the script above.
+- **`ECONNREFUSED 127.0.0.1:9222` / Chrome not running** — In `real` mode the server probes 9222 via `node:http.get /json/version` (`agent:false` explicitly bypasses `http_proxy`/`https_proxy`, avoiding false "port closed" when your proxy would intercept the localhost probe). **Probing TCP alone is not enough** — Chrome startup order is TCP first → then DevTools HTTP → then `/json/version` responds; checking only TCP causes a race (TCP up but `connectOverCDP` immediately throws). So it waits for `/json/version` 200. If closed, it auto-spawns `$CHROME_STARTER` (path appears in the error message; default `~/.pi/agent/start-agent-chrome.sh`) and polls for up to 20s. On Linux it uses `bash -c 'nohup … &'` (in this env `spawn(…, {detached:true})` can't start Chrome); on Windows it directly spawns `chrome.exe`. If auto-start still fails, launch manually.
 - **`fill: Timeout … element is not visible`** — You likely clicked/typed a hidden element (e.g. a `0×0`/`opacity:0` decorative control). Re-run `snapshot`; the visibility filter should now exclude it. If a genuinely visible element still fails, its ref may be stale — re-snapshot.
 - **`ref=eN 未命中` (stale ref)** — The page changed since the last `snapshot` (navigation, dynamic content, element removed/re-rendered). Re-run `snapshot` and use the new ref.
 - **`ref=eN 命中 N 个` (duplicate ref)** — A snapshot-internal error (refs should be unique). Re-snapshot; if it persists, file an issue.

@@ -2,7 +2,7 @@
 /**
  * agentic-browser-mcp — Pi 浏览器能力的独立 MCP server。
  *
- * 逻辑与 pi 扩展 ~/.pi/agent/extensions/browser-tool.ts 对齐(单一行为基准),
+ * 逻辑与 pi 扩展的 browser-tool.ts 对齐(单一行为基准,原路径 ~/.pi/agent/extensions/),
  * 但脱离 pi 进程,以 MCP server 形式供 Codex / pi / 任意 MCP client 连接。
  *
  * 后端:Playwright 1.61
@@ -31,16 +31,22 @@ import { mkdirSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import * as os from "node:os";
 import { spawn } from "node:child_process";
-import { createConnection } from "node:net";
+import * as http from "node:http";
 
-const AGENT_DIR = join(os.homedir(), ".pi", "agent");
-const ISOLATED_PROFILE = join(AGENT_DIR, "bw-mcp-profile");
+// ===== 路径配置: 环境变量优先,默认值兜底(向后兼容 Pi 环境) =====
+// 覆盖示例: AGENT_BROWSER_DIR=/data/my-agent node index.mjs
+// 细分覆盖(可选): AGENT_BROWSER_CHROME_STARTER / AGENT_BROWSER_CDP_PROFILE
+//                  AGENT_BROWSER_ISOLATED_PROFILE / AGENT_BROWSER_LOG_FILE
+const AGENT_DIR = process.env.AGENT_BROWSER_DIR ?? join(os.homedir(), ".pi", "agent");
+const ISOLATED_PROFILE = process.env.AGENT_BROWSER_ISOLATED_PROFILE ?? join(AGENT_DIR, "bw-mcp-profile");
 const CDP_ENDPOINT = "http://127.0.0.1:9222";
-const CHROME_STARTER = join(AGENT_DIR, "start-agent-chrome.sh");
+const CHROME_STARTER = process.env.AGENT_BROWSER_CHROME_STARTER ?? join(AGENT_DIR, "start-agent-chrome.sh");
 
 // Windows: 自动查找系统 Chrome，CDP 模式专用 profile
 const IS_WIN = process.platform === "win32";
-const CDP_PROFILE = join(AGENT_DIR, "chrome-cdp-profile");
+const CDP_PROFILE = process.env.AGENT_BROWSER_CDP_PROFILE ?? join(AGENT_DIR, "chrome-cdp-profile");
+// Chrome 启动日志路径
+const CHROME_LOG_FILE = process.env.AGENT_BROWSER_LOG_FILE ?? join(os.tmpdir(), "agentic-browser-mcp-chrome.log");
 const CHROME_CANDIDATES_WIN = [
   join(os.homedir(), "AppData", "Local", "Google", "Chrome", "Application", "chrome.exe"),
   "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
@@ -49,6 +55,7 @@ const CHROME_CANDIDATES_WIN = [
 const SNAPSHOT_MAX_CHARS = 12000;
 const SHUTDOWN_TIMEOUT_MS = 3000;
 const CHROME_BOOT_TIMEOUT_MS = 20000; // 自动拉起 Chrome 的最长等待
+const DISPOSE_TIMEOUT_MS = 5000; // safeDispose 运行时路径超时兜底
 
 // ===== 会话管理(与 browser-tool.ts 同构) =====
 // 模块级单例:跨 MCP 请求/transport 共享同一个 Playwright 会话(=同一个 Chrome)。
@@ -68,24 +75,29 @@ function serialize(fn) {
 // real 模式需要 9222 在听;AI 不该要求用户手动开 Chrome。
 // 探测 9222,不通就 detached spawn start-agent-chrome.sh,轮询等待它起来。
 
-// 探测 9222 是否在听。用 TCP 连接(不走 HTTP 代理环境变量,避免 undici fetch
-// 读 http_proxy 把 127.0.0.1:9222 发给代理 7897 导致误判)。
+// 探测 9222 的 DevTools HTTP 服务是否就绪。
+// 必须 HTTP GET /json/version 拿到 200,而不是 TCP 连通——chrome 启动时序是
+// 先开 TCP → 再起 DevTools HTTP → 再能响应 /json/version,只验证 TCP 会造成
+// 时序竞态(TCP 通但 connectOverCDP 立即抛错)。
+// 用 node:http + agent:false 显式不走 http_proxy 环境变量。
 function chromeUp() {
   return new Promise((resolve) => {
-    const sock = createConnection({ host: "127.0.0.1", port: 9222 }, () => {
-      sock.end();
-      resolve(true);
-    });
-    sock.on("error", () => resolve(false));
-    sock.setTimeout(1500, () => {
-      sock.destroy();
+    const req = http.get(
+      { host: "127.0.0.1", port: 9222, path: "/json/version", agent: false },
+      (res) => {
+        res.resume();
+        res.on("end", () => resolve(res.statusCode === 200));
+      },
+    );
+    req.on("error", () => resolve(false));
+    req.setTimeout(1500, () => {
+      req.destroy();
       resolve(false);
     });
   });
 }
 
 function spawnStarter() {
-  // Windows: 直接 spawn chrome.exe（无 bash/nohup）
   // Windows: 直接 spawn chrome.exe（无 bash/nohup）
   if (IS_WIN) {
     try {
@@ -108,7 +120,7 @@ function spawnStarter() {
   try {
     const child = spawn(
       "bash",
-      ["-c", `nohup ${JSON.stringify(CHROME_STARTER)} > /tmp/agentic-browser-mcp-chrome.log 2>&1 &`],
+      ["-c", `nohup ${JSON.stringify(CHROME_STARTER)} > ${JSON.stringify(CHROME_LOG_FILE)} 2>&1 &`],
       { stdio: "ignore" },
     );
     child.on("error", () => {});
@@ -132,6 +144,8 @@ async function ensureChromeUp() {
   return false;
 }
 
+// 绑当前 page + 监听后续新 tab(opened via target="_blank" / window.open() / 手动)
+// 都写入同一个 consoleBuffer,避免新 tab 的日志丢失。
 function attachConsoleListener(s) {
   s.consoleBuffer = [];
   const push = (type, text) => {
@@ -142,11 +156,38 @@ function attachConsoleListener(s) {
       /* never crash */
     }
   };
+  const bindPage = (page) => {
+    try {
+      page.on("console", (m) => push(m.type(), m.text()));
+      page.on("pageerror", (e) => push("error", String(e)));
+    } catch {
+      /* ignore */
+    }
+  };
   try {
-    s.page.on("console", (m) => push(m.type(), m.text()));
-    s.page.on("pageerror", (e) => push("error", String(e)));
+    bindPage(s.page);
+    // 后续打开的 tab 也绑,不漏 console
+    s.context.on("page", bindPage);
   } catch {
     /* ignore */
+  }
+}
+
+// 刷新"当前活动 page":s.page 原本指向 session 建立时的 tab,但用户/AI 后续
+// 可能打开/切换 tab。这里把 s.page 切到 context 里最后活动的 page。
+// 当 s.page 已关闭或不再是最后一个 page 时自动切换。
+// 各工具调用前先 refreshActivePage(s) 一次,保证操作的是用户当前看到的页面。
+function refreshActivePage(s) {
+  try {
+    const pages = s.context.pages();
+    if (pages.length === 0) return s.page;
+    const last = pages[pages.length - 1];
+    if (!s.page || s.page.isClosed?.() || s.page !== last) {
+      s.page = last;
+    }
+    return s.page;
+  } catch {
+    return s.page;
   }
 }
 
@@ -177,7 +218,13 @@ function sameProfile(s, profile, incognito) {
 
 async function safeDispose(s) {
   try {
-    await s.dispose();
+    // 运行时路径加超时兜底,防 chrome 崩了 Playwright browser.close() 挂住
+    // 整个 serialize chain,导致 MCP server 假死。
+    // 进程退出路径在 shutdown() 里已有 Promise.race(timeout=3000),这里补运行时。
+    await Promise.race([
+      s.dispose(),
+      new Promise((_, rej) => setTimeout(() => rej(new Error("dispose timeout")), DISPOSE_TIMEOUT_MS)),
+    ]);
   } catch {
     /* ignore */
   }
@@ -214,7 +261,7 @@ async function ensureSession(opts = {}) {
       const up = await ensureChromeUp();
       if (!up) {
         throw new Error(
-          "专用 Chrome(9222)未启动且自动拉起失败。请手动执行 ~/.pi/agent/start-agent-chrome.sh",
+          `专用 Chrome(9222)未启动且自动拉起失败。请手动执行 ${CHROME_STARTER}`,
         );
       }
       const browser = await chromium.connectOverCDP(CDP_ENDPOINT);
@@ -236,6 +283,7 @@ async function ensureSession(opts = {}) {
       };
       attachConsoleListener(s);
       current = s;
+      syncTabCount(); // 新建/切换 real 会话时同步 tab 计数基准
       return s;
     }
 
@@ -264,9 +312,9 @@ async function ensureSession(opts = {}) {
     };
     attachConsoleListener(s);
     current = s;
+    syncTabCount(); // 新建/切换 isolated 会话时同步 tab 计数基准
     return s;
   });
-  syncTabCount();
 }
 
 function tryUrl(page) {
@@ -306,12 +354,15 @@ function locateByRole(page, role, name) {
 function createServer() {
   const server = new McpServer({ name: "agentic-browser-mcp", version: "0.1.0" });
 
-  // content helpers —— 错误用 isError:true,让 MCP client(Codex)正确识别失败
+  // content helpers —— 错误用 isError:true,让 MCP client(Codex)正确识别失败。
+  // err(prefix, e, hint?) 输出格式: "<prefix>: <msg>\n→ <hint>"
+  // hint 是给 AI 的下一步建议(可执行动作),让 AI 能从错误中恢复而不是卡住。
   const ok = (t) => ({ content: [{ type: "text", text: t + tabHint() }] });
-  const err = (prefix, e) => ({
-    content: [{ type: "text", text: `${prefix}: ${e?.message ?? e}` }],
-    isError: true,
-  });
+  const err = (prefix, e, hint) => {
+    const msg = e?.message ?? String(e);
+    const text = hint ? `${prefix}: ${msg}\n→ ${hint}` : `${prefix}: ${msg}`;
+    return { content: [{ type: "text", text }], isError: true };
+  };
 
   // 1. session
   server.registerTool("browser_session", {
@@ -332,7 +383,11 @@ function createServer() {
       });
       return ok(toText({ ok: true, type: s.type, url: tryUrl(s.page), title: await tryTitle(s.page) }));
     } catch (e) {
-      return err(`浏览器会话失败\n提示: 请确认专用 Chrome 已启动(~/.pi/agent/start-agent-chrome.sh)且 9222 在听`, e);
+      return err(
+        "浏览器会话失败",
+        e,
+        `检查步骤: 1) curl http://127.0.0.1:9222/json/version 看是否返回 200; 2) 不通则手动执行 ${CHROME_STARTER}; 3) 若需特定登录态,检查 ${CHROME_STARTER} 脚本里的 --user-data-dir 指向哪个 profile,换成带登录态的; 4) 判断 profile 是否带某站登录: strings <profile>/Default/Cookies | grep -i <domain>; 5) Chrome 起来后重试 browser_session`,
+      );
     }
   });
 
@@ -347,12 +402,23 @@ function createServer() {
   }, async (params) => {
     try {
       const s = params.profile
-        ? await ensureSession({ profile: params.profile, headless: params.headless, force: true })
+        ? await ensureSession({
+            profile: params.profile,
+            headless: params.headless,
+            // 只有 profile 与当前会话不同才真的 force 切换,
+            // 避免传默认值 "real" 也触发无谓的断开+重连 CDP。
+            force: current ? !sameProfile(current, params.profile, false) : true,
+          })
         : await ensureSession();
+      refreshActivePage(s);
       await s.page.goto(params.url, { waitUntil: "domcontentloaded", timeout: 30000 });
       return ok(toText({ ok: true, url: tryUrl(s.page), title: await tryTitle(s.page) }));
     } catch (e) {
-      return err("导航失败", e);
+      return err(
+        "导航失败",
+        e,
+        "常见原因: 1) URL 格式错误(应带 http:// 或 https://); 2) Chrome 未启动(先调 browser_session); 3) 目标站点需要登录态但当前 profile 没登录(切到带登录态的 profile,或先 browser_navigate 到登录页手动登录); 4) 网络问题(检查 --proxy-server 是否可达); 排查: 用 browser_eval 执行 location.href 看当前页,或 browser_console 看 error 级日志",
+      );
     }
   });
 
@@ -365,6 +431,7 @@ function createServer() {
  }, async (params) => {
    try {
      const s = await ensureSession();
+     refreshActivePage(s);
      const mode = params?.mode ?? "viewport";
      // 注入 JS：扫描可交互元素 + 分配 data-agent-ref（借鉴 Cursor Element Ref 系统）
      const t = await s.page.evaluate(({ maxChars, mode }) => {
@@ -441,7 +508,11 @@ function createServer() {
      }, { maxChars: SNAPSHOT_MAX_CHARS, mode });
      return ok(t);
    } catch (e) {
-     return err("snapshot 失败", e);
+     return err(
+       "snapshot 失败",
+       e,
+       "常见原因: 1) Chrome 未启动(先调 browser_session); 2) 页面还没加载完(等几秒或先 browser_navigate 到目标 URL); 3) 页面是 about:blank 或 chrome:// 内部页(这些页面 DOM 可交互元素少,属正常); 排查: 用 browser_eval 执行 document.readyState 看加载状态",
+     );
    }
  });
 
@@ -454,16 +525,33 @@ function createServer() {
      name: z.string().optional().describe("元素的可访问名称(accessible name)"),
    },
  }, async (params) => {
-   if (!params.ref && !params.role) return err("参数缺失", new Error("必须提供 ref 或 role"));
-   if (params.ref && !/^e\d+$/.test(params.ref)) return err("ref 非法", new Error(`ref 必须形如 e3，收到 ${params.ref}`));
+   if (!params.ref && !params.role) return err(
+     "参数缺失",
+     new Error("必须提供 ref 或 role"),
+     `正确用法: 先 browser_snapshot 拿到元素列表,然后用 ref 精确定位(如 click({ref: 'e3'})),或用 role+name 回退(如 click({role: 'button', name: 'Sign in'}))`,
+   );
+   if (params.ref && !/^e\d+$/.test(params.ref)) return err(
+     "ref 非法",
+     new Error(`ref 必须形如 e3,收到 ${params.ref}`),
+     "ref 格式: e + 数字(如 e1, e2, e3),来自最近一次 browser_snapshot 的输出。不要自己编造 ref,也不要用 CSS 选择器或 xpath",
+   );
    try {
      const s = await ensureSession();
+     refreshActivePage(s);
      let loc;
      if (params.ref) {
        const sel = `[data-agent-ref="${params.ref}"]`;
        const cnt = await s.page.locator(sel).count();
-       if (cnt === 0) return err("ref 失效", new Error(`ref=${params.ref} 未命中（页面可能已变化），请重新 snapshot`));
-       if (cnt > 1) return err("ref 重复", new Error(`ref=${params.ref} 命中 ${cnt} 个（快照内部错误），请重新 snapshot`));
+       if (cnt === 0) return err(
+         "ref 失效",
+         new Error(`ref=${params.ref} 未命中`),
+         "原因: 上次 snapshot 后页面变了(导航/动态渲染/元素被移除)。恢复: 重新调 browser_snapshot 获取新 ref 列表,然后用新 ref 重试 click",
+       );
+       if (cnt > 1) return err(
+         "ref 重复",
+         new Error(`ref=${params.ref} 命中 ${cnt} 个(快照内部错误)`),
+         "这不应发生,可能是页面被多次渲染。恢复: 重新调 browser_snapshot(ref 会重新分配),若持续出现请提 issue",
+       );
        loc = s.page.locator(sel).first();
      } else {
        loc = locateByRole(s.page, params.role || "", params.name);
@@ -471,7 +559,11 @@ function createServer() {
      await loc.click({ timeout: 10000 });
      return ok(`已点击 ${params.ref ? `ref=${params.ref}` : `${params.role}${params.name ? ` "${params.name}"` : ''}`}`);
    } catch (e) {
-     return err("点击失败", e);
+     return err(
+       "点击失败",
+       e,
+       "常见原因: 1) 元素被遮挡(用 browser_eval 滚动到元素: el.scrollIntoView()); 2) 元素在 iframe 里(snapshot 默认不穿透 closed shadow root,改用 browser_eval 直接操作); 3) 元素需要先 hover(用 browser_eval 触发 mouseenter); 4) 是 SPA 动态加载的元素(等加载完再 snapshot)",
+     );
    }
  });
 
@@ -485,16 +577,33 @@ function createServer() {
      text: z.string().describe("要输入的文本"),
    },
  }, async (params) => {
-   if (!params.ref && !params.role) return err("参数缺失", new Error("必须提供 ref 或 role"));
-   if (params.ref && !/^e\d+$/.test(params.ref)) return err("ref 非法", new Error(`ref 必须形如 e3，收到 ${params.ref}`));
+   if (!params.ref && !params.role) return err(
+     "参数缺失",
+     new Error("必须提供 ref 或 role"),
+     `正确用法: 先 browser_snapshot 拿到输入框的 ref(通常是 textbox/searchbox/combobox role),然后用 type({ref: 'e2', text: '要输入的内容'})`,
+   );
+   if (params.ref && !/^e\d+$/.test(params.ref)) return err(
+     "ref 非法",
+     new Error(`ref 必须形如 e3,收到 ${params.ref}`),
+     "ref 格式: e + 数字(如 e1, e2, e3),来自最近一次 browser_snapshot 的输出",
+   );
    try {
      const s = await ensureSession();
+     refreshActivePage(s);
      let loc;
      if (params.ref) {
        const sel = `[data-agent-ref="${params.ref}"]`;
        const cnt = await s.page.locator(sel).count();
-       if (cnt === 0) return err("ref 失效", new Error(`ref=${params.ref} 未命中（页面可能已变化），请重新 snapshot`));
-       if (cnt > 1) return err("ref 重复", new Error(`ref=${params.ref} 命中 ${cnt} 个（快照内部错误），请重新 snapshot`));
+       if (cnt === 0) return err(
+         "ref 失效",
+         new Error(`ref=${params.ref} 未命中`),
+         "原因: 上次 snapshot 后页面变了。恢复: 重新调 browser_snapshot 获取新 ref,然后用新 ref 重试 type",
+       );
+       if (cnt > 1) return err(
+         "ref 重复",
+         new Error(`ref=${params.ref} 命中 ${cnt} 个(快照内部错误)`),
+         "这不应发生。恢复: 重新调 browser_snapshot,若持续出现请提 issue",
+       );
        loc = s.page.locator(sel).first();
      } else {
        loc = locateByRole(s.page, params.role || "", params.name);
@@ -502,7 +611,11 @@ function createServer() {
      await loc.fill(params.text, { timeout: 10000 });
      return ok(`已在 ${params.ref ? `ref=${params.ref}` : `${params.role}${params.name ? ` "${params.name}"` : ''}`} 输入 ${JSON.stringify(params.text)}`);
    } catch (e) {
-     return err("输入失败", e);
+     return err(
+       "输入失败",
+       e,
+       "常见原因: 1) 元素不是 input/textarea/contenteditable(用 browser_eval 检查 el.tagName); 2) 元素是 readonly/disabled(检查 el.readOnly / el.disabled); 3) 被 SPA 框架接管(React/Vue 需要触发原生 input 事件,改用 browser_eval: el.value=\"...\"; el.dispatchEvent(new Event('input', {bubbles:true}))",
+     );
    }
  });
 
@@ -514,10 +627,15 @@ function createServer() {
   }, async (params) => {
     try {
       const s = await ensureSession();
+      refreshActivePage(s);
       const result = await s.page.evaluate(params.code);
       return ok(toText(result));
     } catch (e) {
-      return err("eval 失败", e);
+      return err(
+        "eval 失败",
+        e,
+        "注意: code 参数是 JS 表达式(不是箭头函数),直接在页面执行。错误示例: '=> 1+1' 错(不要箭头函数); 正确: '1+1' 或 'document.title'。要执行多行语句用 IIFE: '(async () => { ... })()'。循环引用的对象会被 JSON.stringify 转成 '[object Object]'",
+      );
     }
   });
 
@@ -531,6 +649,7 @@ function createServer() {
   }, async (params) => {
     try {
       const s = await ensureSession();
+      refreshActivePage(s);
       let result;
       if (params.type === "cookies") {
         result = await s.context.cookies(params.url);
@@ -542,7 +661,11 @@ function createServer() {
       }
       return ok(toText(result));
     } catch (e) {
-      return err("storage 失败", e);
+      return err(
+        "storage 失败",
+        e,
+        "type 参数必须是 cookies / localStorage / sessionStorage 之一。读 cookies 时若指定 url,需是完整 URL(含协议)。localStorage/sessionStorage 在跨域页面访问会被浏览器同源策略拦截,确保 browser_navigate 到目标域后再读",
+      );
     }
   });
 
@@ -558,7 +681,11 @@ function createServer() {
       const entries = buf.slice(-100);
       return ok(toText(entries));
     } catch (e) {
-      return err("console 失败", e);
+      return err(
+        "console 失败",
+        e,
+        "console buffer 在 session 建立后开始记录。若没记录到,可能: 1) 当前页面没产生 console 输出; 2) 监听器绑在 session 建立时的 page(现已修复为绑 context,新 tab 也能收集); 3) 想看实时日志,用 browser_eval 直接劫持 console.log",
+      );
     }
   });
 
@@ -570,30 +697,40 @@ function createServer() {
   }, async (params) => {
     try {
       const s = await ensureSession();
+      refreshActivePage(s);
       const url = tryUrl(s.page);
       return ok(
         `🔒 需要人工操作:${params.reason}\n当前页面:${url || "(未知)"}\n` +
           `请在浏览器里操作完,然后回到调用方终端回复『继续』。`,
       );
     } catch (e) {
-      return err("wait_human 失败", e);
+      return err(
+        "wait_human 失败",
+        e,
+        "wait_human 用于验证码/2FA/登录等需人工介入的场景。它返回当前 URL 和操作说明给 AI,AI 应把提示转达给用户并暂停。若 Chrome 不可达,先 browser_session 重建会话",
+      );
     }
   });
 
   // 10. screenshot
   server.registerTool("browser_screenshot", {
-    description: "截图存为文件(配角:非多模态模型不解读,主要给人看)。默认存 ~/.pi/agent/bw-shots/。",
+    description: `截图存为文件(配角:非多模态模型不解读,主要给人看)。默认存 ${join(AGENT_DIR, "bw-shots")}/。`,
     inputSchema: { fullPage: z.boolean().optional().describe("是否整页截图") },
   }, async (params) => {
     try {
       const s = await ensureSession();
+      refreshActivePage(s);
       const dir = join(AGENT_DIR, "bw-shots");
       mkdirSync(dir, { recursive: true });
       const file = join(dir, `shot-${Date.now()}.png`);
       await s.page.screenshot({ path: file, fullPage: !!params.fullPage });
       return ok(`截图已存:${file}`);
     } catch (e) {
-      return err("screenshot 失败", e);
+      return err(
+        "screenshot 失败",
+        e,
+        `截图存到 ${join(AGENT_DIR, "bw-shots")}/shot-<timestamp>.png。失败原因通常是页面还没加载完或 Chrome 崩了。注意: 非多模态模型无法解读截图内容,建议改用 browser_snapshot 拿 DOM 文本`,
+      );
     }
   });
 

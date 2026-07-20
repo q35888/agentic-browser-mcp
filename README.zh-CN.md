@@ -10,15 +10,43 @@
 - **两种会话模式**:
   - `real` —— `connectOverCDP` 连接 9222 端口上已有的 Chrome(复用登录态:cookie、session、2FA)
   - `isolated` —— `launchPersistentContext` 用独立 profile(有头/无头)
-- **自动拉起 Chrome**:9222 端口不通时,server 会自动 spawn 你的 Chrome 启动脚本并等待就绪——无需手动开浏览器。
+- **自动拉起 Chrome**:9222 端口不通时,server 会自动 spawn 你的 Chrome 启动脚本并等待就绪——无需手动开浏览器。探测方式为 HTTP `GET /json/version`(不是裸 TCP,避免 chrome 启动时序竞态);用 `node:http` + `agent:false` 显式不走 `http_proxy`。
 - **Element Ref 定位**(借鉴 Cursor):`snapshot` 给每个可交互元素分配一个稳定的 `ref`(`e1`、`e2`、…),返回形如 `- [ref=e3] button "Sign in"` 的列表;`click`/`type` 优先用 `ref` 精确定位,也可回退到 `role` + `name`。穿透 open shadow root,把原生标签映射成隐式 ARIA role(`<a>`→`link`、`<select>`→`combobox` 等),用 `checkVisibility()` + 非零尺寸过滤隐藏元素。**默认只返回视口内元素**(`mode=all` 返回全部)——复杂页面大幅省 token。
 - **两种传输**:`stdio`(默认,适合 Codex 式 spawn)和 `http`(无状态流式,`--transport http --port 9223`)。
+- **活动 tab 自动跟随**:打开新 tab(`<a target="_blank">` / `window.open()`)后,后续 `click` / `type` / `snapshot` 等工具自动切到新 tab(基于 `context.pages()` 末尾,每次工具调用前 `refreshActivePage`)。**已知限制**:用户在 Chrome UI 里手动切 tab 不会跟随——Playwright CDP 没暴露稳定的"聚焦 tab"API;必要时用 `browser_eval` 调 `chrome.tabs.update` 兜底。
+- **会话健壮性**:`safeDispose` 加了 5s 运行时超时,防止 Chrome 崩溃后 Playwright `browser.close()` 挂住整个串行链导致 MCP server 假死;`syncTabCount` 在新建/切换会话时正确同步基准(不再写 unreachable code);`console` listener 绑在 `context.on("page")` 上,新打开 tab 的 console 日志也能被 `browser_console` 读到。
 
 ## 环境要求
 
 - Node.js ≥ 18
 - 已装 Playwright 兼容的 Chrome/Chromium(`google-chrome-stable` 即可)
 - `real` 模式:一个用 `--remote-debugging-port=9222` 和独立 `user-data-dir` 启动的 Chrome(见[用 CDP 启动 Chrome](#用-cdp-启动-chromereal-模式))
+
+### 路径配置(环境变量)
+
+所有路径都走环境变量,默认值兜底兼容 Pi 环境。换设备/换部署目录时只需设一个或几个 env var:
+
+| 环境变量 | 默认值 | 说明 |
+|---|---|---|
+| `AGENT_BROWSER_DIR` | `~/.pi/agent` | 根目录,其他路径默认从这里派生 |
+| `AGENT_BROWSER_CHROME_STARTER` | `<AGENT_BROWSER_DIR>/start-agent-chrome.sh` | Chrome 启动脚本路径 |
+| `AGENT_BROWSER_CDP_PROFILE` | `<AGENT_BROWSER_DIR>/chrome-cdp-profile` | CDP 模式 profile 目录 |
+| `AGENT_BROWSER_ISOLATED_PROFILE` | `<AGENT_BROWSER_DIR>/bw-mcp-profile` | isolated 模式 profile 目录 |
+| `AGENT_BROWSER_LOG_FILE` | `os.tmpdir()/agentic-browser-mcp-chrome.log` | Chrome 启动日志路径 |
+
+覆盖示例:
+
+```bash
+# 只改根目录(其他路径自动跟随)
+AGENT_BROWSER_DIR=/data/my-agent node index.mjs
+
+# 精确控制各路径
+AGENT_BROWSER_CHROME_STARTER=/opt/chrome/launch.sh \
+AGENT_BROWSER_CDP_PROFILE=/opt/chrome/profiles/logged-in \
+node index.mjs
+```
+
+错误消息和工具描述里的所有路径都是动态的,不会硬编码 `~/.pi/agent`。
 
 ## 安装
 
@@ -56,6 +84,12 @@ Chrome 150+ 做远程调试需要非默认的 user-data-dir。示例启动脚本
 
 ```bash
 #!/usr/bin/env bash
+# ⚠️ 示例 profile 路径,请根据实际部署调整:
+#    - 默认示例:  $HOME/.agentic-browser-chrome-profile(全新无登录态)
+#    - Pi 环境:    /tmp/chrome-outlook-profile(由 ~/.pi/agent/start-agent-chrome.sh 指定)
+#    - Pi 带登录态: $HOME/.pi/agent/chrome-cdp-profile(已通过 sync-profile.sh 同步)
+# 判断某个 profile 是否带目标站点登录态:
+#    strings <profile>/Default/Cookies | grep -i <domain>   # 有命中说明带 cookie
 PROFILE="$HOME/.agentic-browser-chrome-profile"
 mkdir -p "$PROFILE"
 # 从非图形环境 spawn 时,补上图形会话环境变量
@@ -88,13 +122,13 @@ Chrome 136+ 出于安全考虑,**禁止默认 profile 开 `--remote-debugging-po
 | 工具 | 说明 |
 |---|---|
 | `browser_session` | 启动/切换会话(`real`/`isolated`、`headless`、`incognito`)。无参 = 确保默认 `real`。 |
-| `browser_navigate` | 打开 URL。 |
-| `browser_snapshot` | 列出带 `ref` 编号的可交互元素,如 `- [ref=e3] button "Sign in"`。默认 `mode=viewport`(只视口内,省 token);`mode=all` 返回全部。用 `ref` 做 `click`/`type`。 |
+| `browser_navigate` | 打开 URL。显式传 `profile` 时仅在 profile 与当前会话不同时才重连 CDP(传默认值 `"real"` 不再触发无谓断开)。 |
+| `browser_snapshot` | 列出带 `ref` 编号的可交互元素,如 `- [ref=e3] button "Sign in"`。默认 `mode=viewport`(只视口内,省 token);`mode=all` 返回全部。用 `ref` 做 `click`/`type`。**每次工具调用前会自动 `refreshActivePage`**——新打开的 tab(`<a target="_blank">` / `window.open()`)会被自动跟随。 |
 | `browser_click` | 用 `ref` 点击(首选,如 `e3`),或 `role`(+`name`)。`ref` 会校验 `^e\d+$` 并检查恰好命中 1 个(0=失效,>1=重复 → 重新 snapshot)。 |
 | `browser_type` | 用 `ref` 输入(首选),或 `role`(+`name`)。校验同 `click`。 |
 | `browser_eval` | 在页面执行 JS 表达式(读 DOM/storage/发请求)。 |
 | `browser_storage` | 读 `cookies` / `localStorage` / `sessionStorage`。 |
-| `browser_console` | 读缓冲的 console 日志(可选 `level` 过滤)。 |
+| `browser_console` | 读缓冲的 console 日志(可选 `level` 过滤)。监听绑在 `context.on("page")`,后续新 tab 的 console 也会被收集。 |
 | `browser_wait_human` | 验证码/需人工步骤时——返回一个提示;调用方的 agent 暂停等用户回复。 |
 | `browser_screenshot` | 截图存成 PNG。 |
 | `browser_close` | 关闭当前会话(`real` 只断开 CDP,绝不杀真实 Chrome)。 |
@@ -138,6 +172,12 @@ type    { ref: "e2", text: "playwright" }
 
 ## 备注
 
+📌 **多 tab 行为** —— 每个工具调用前会自动 `refreshActivePage(s)`,把 `s.page` 切到 `context.pages()` 的最后一个。这意味着:
+- ✅ `click <a target="_blank">`、`window.open()`、`browser_navigate` 打开新 tab → 后续操作自动跟随新 tab
+- ❌ **用户在 Chrome UI 里手动切换 tab → 不会跟随**(Playwright CDP 没暴露稳定的"聚焦 tab" API)
+- ❌ 关闭最后一个 tab → 切到倒数第二个;关闭所有 tab → 报错,需 `browser_session` 重建
+- 兜底:用 `browser_eval` 调 `chrome.tabs.update({active: true})` 主动激活
+
 📖 **帮用户配置这个 MCP？** 读 [`docs/agent-guide.md`](./docs/agent-guide.md)——摸清环境、装依赖、写配置、验证、踩坑全覆盖。
 
 🆚 **和官方 `@playwright/mcp` 比怎么样？** 看 [`docs/vs-playwright-mcp.md`](./docs/vs-playwright-mcp.md)——底层都是 Playwright，取舍不同（登录态复用、省 token 快照、Chrome 自动拉起、工具描述中文优先）。
@@ -148,7 +188,7 @@ type    { ref: "e2", text: "playwright" }
 
 ## 故障排查
 
-- **`ECONNREFUSED 127.0.0.1:9222` / Chrome 没开** —— `real` 模式下,server 用原始 TCP 连接(`node:net`,**不是** `fetch`——`fetch` 会遵守 `http_proxy`/`https_proxy`,把 localhost 探测发到你的 HTTP 代理,从而误报端口不通)探测 9222。不通则自动 spawn `$CHROME_STARTER`(默认 `~/.pi/agent/start-agent-chrome.sh`)并轮询最多 20s。Linux 下用 `bash -c 'nohup … &'`(本环境下 `spawn(…, {detached:true})` 起不来 Chrome);Windows 下直接 spawn `chrome.exe`。自动拉起仍失败,就用手动脚本启动。
+- **`ECONNREFUSED 127.0.0.1:9222` / Chrome 没开** —— `real` 模式下,server 用 `node:http.get /json/version`(`agent:false` 显式不走 `http_proxy`/`https_proxy`,避免 localhost 探测被发到 HTTP 代理)探测 9222 的 DevTools HTTP 服务。**只验 TCP 端口不够**——chrome 启动时序是 先开 TCP → 再起 DevTools HTTP → 再能响应 `/json/version`,只验 TCP 会造成时序竞态(TCP 通但 `connectOverCDP` 立即抛错)。所以必须等 `/json/version` 返回 200。探测不通则自动 spawn `$CHROME_STARTER`(路径见错误消息,默认 `~/.pi/agent/start-agent-chrome.sh`)并轮询最多 20s。Linux 下用 `bash -c 'nohup … &'`(本环境下 `spawn(…, {detached:true})` 起不来 Chrome);Windows 下直接 spawn `chrome.exe`。自动拉起仍失败,就用手动脚本启动。
 - **`fill: Timeout … element is not visible`** —— 你可能点/输入了一个隐藏元素(如 `0×0`/`opacity:0` 的装饰性控件)。重新 `snapshot`,可见性过滤器现在应能排除它。若确实可见的元素仍失败,可能是 ref 失效——重新 snapshot。
 - **`ref=eN 未命中`(ref 失效)** —— 上次 `snapshot` 后页面变了(导航、动态内容、元素被移除/重渲染)。重新 `snapshot`,用新 ref。
 - **`ref=eN 命中 N 个`(ref 重复)** —— 快照内部错误(ref 本应唯一)。重新 snapshot;若持续出现,提 issue。

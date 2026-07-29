@@ -6,14 +6,14 @@
 
 ## 特性
 
-- **11 个工具**:`browser_session`、`browser_navigate`、`browser_snapshot`、`browser_click`、`browser_type`、`browser_eval`、`browser_storage`、`browser_console`、`browser_wait_human`、`browser_screenshot`、`browser_close`
+- **15 个工具**:`browser_session`、`browser_navigate`、`browser_snapshot`、`browser_click`、`browser_type`、`browser_select_option`、`browser_hover`、`browser_tabs`、`browser_handle_dialog`、`browser_eval`、`browser_storage`、`browser_console`、`browser_wait_human`、`browser_screenshot`、`browser_close`
 - **两种会话模式**:
   - `real` —— `connectOverCDP` 连接 9222 端口上已有的 Chrome(复用登录态:cookie、session、2FA)
   - `isolated` —— `launchPersistentContext` 用独立 profile(有头/无头)
 - **自动拉起 Chrome**:9222 端口不通时,server 会自动 spawn 你的 Chrome 启动脚本并等待就绪——无需手动开浏览器。探测方式为 HTTP `GET /json/version`(不是裸 TCP,避免 chrome 启动时序竞态);用 `node:http` + `agent:false` 显式不走 `http_proxy`。
 - **Element Ref 定位**(借鉴 Cursor):`snapshot` 给每个可交互元素分配一个稳定的 `ref`(`e1`、`e2`、…),返回形如 `- [ref=e3] button "Sign in"` 的列表;`click`/`type` 优先用 `ref` 精确定位,也可回退到 `role` + `name`。穿透 open shadow root,把原生标签映射成隐式 ARIA role(`<a>`→`link`、`<select>`→`combobox` 等),用 `checkVisibility()` + 非零尺寸过滤隐藏元素。**默认只返回视口内元素**(`mode=all` 返回全部)——复杂页面大幅省 token。
 - **两种传输**:`stdio`(默认,适合 Codex 式 spawn)和 `http`(无状态流式,`--transport http --port 9223`)。
-- **活动 tab 自动跟随**:打开新 tab(`<a target="_blank">` / `window.open()`)后,后续 `click` / `type` / `snapshot` 等工具自动切到新 tab(基于 `context.pages()` 末尾,每次工具调用前 `refreshActivePage`)。**已知限制**:用户在 Chrome UI 里手动切 tab 不会跟随——Playwright CDP 没暴露稳定的"聚焦 tab"API;必要时用 `browser_eval` 调 `chrome.tabs.update` 兜底。
+- **活动 tab 自动跟随 + 显式管理**:打开新 tab(`<a target="_blank">` / `window.open()`)后,后续 `click` / `type` / `snapshot` 等工具自动切到新 tab(基于 `context.pages()` 末尾,每次工具调用前 `refreshActivePage`)。需要显式控制时用 `browser_tabs`(list/switch/close/new):`switch` 会把目标 tab **钉住**,直到有新 tab 出现才让位、恢复自动跟随。**已知限制**:用户在 Chrome UI 里手动切 tab 不会跟随——Playwright CDP 没暴露稳定的"聚焦 tab"API。
 - **会话健壮性**:`safeDispose` 加了 5s 运行时超时,防止 Chrome 崩溃后 Playwright `browser.close()` 挂住整个串行链导致 MCP server 假死;`syncTabCount` 在新建/切换会话时正确同步基准(不再写 unreachable code);`console` listener 绑在 `context.on("page")` 上,新打开 tab 的 console 日志也能被 `browser_console` 读到。
 
 ## 环境要求
@@ -125,6 +125,10 @@ Chrome 136+ 出于安全考虑,**禁止默认 profile 开 `--remote-debugging-po
 | `browser_snapshot` | 列出带 `ref` 编号的可交互元素,如 `- [ref=e3] button "Sign in"`。默认 `mode=viewport`(只视口内,省 token);`mode=all` 返回全部。用 `ref` 做 `click`/`type`。**每次工具调用前会自动 `refreshActivePage`**——新打开的 tab(`<a target="_blank">` / `window.open()`)会被自动跟随。 |
 | `browser_click` | 用 `ref` 点击(首选,如 `e3`),或 `role`(+`name`)。`ref` 会校验 `^e\d+$` 并检查恰好命中 1 个(0=失效,>1=重复 → 重新 snapshot)。 |
 | `browser_type` | 用 `ref` 输入(首选),或 `role`(+`name`)。校验同 `click`。 |
+| `browser_select_option` | 选 `<select>` 下拉项,`ref` 定位(首选)或 `role`+`name`;`values` 传字符串/数组,或 `{label}`/`{value}`/`{index}`。免写 JS。 |
+| `browser_hover` | 鼠标悬停,`ref` 定位(首选)或 `role`+`name`,触发悬停菜单/tooltip。 |
+| `browser_tabs` | 管理标签:`list` / `switch`(按 `index`)/ `close` / `new`(可选 `url`)。显式 `switch` 会钉住,直到新 tab 出现。 |
+| `browser_handle_dialog` | 处理 JS 弹窗(alert/confirm/prompt)。在触发动作【之前】调用,设 `accept`/`dismiss`/`promptText`;`reset` 恢复默认。 |
 | `browser_eval` | 在页面执行 JS 表达式(读 DOM/storage/发请求)。 |
 | `browser_storage` | 读 `cookies` / `localStorage` / `sessionStorage`。 |
 | `browser_console` | 读缓冲的 console 日志(可选 `level` 过滤)。监听绑在 `context.on("page")`,后续新 tab 的 console 也会被收集。 |
@@ -171,11 +175,11 @@ type    { ref: "e2", text: "playwright" }
 
 ## 备注
 
-📌 **多 tab 行为** —— 每个工具调用前会自动 `refreshActivePage(s)`,把 `s.page` 切到 `context.pages()` 的最后一个。这意味着:
+📌 **多 tab 行为** —— 每个工具调用前会自动 `refreshActivePage(s)`,默认跟随 `context.pages()` 的最后一个。这意味着:
 - ✅ `click <a target="_blank">`、`window.open()`、`browser_navigate` 打开新 tab → 后续操作自动跟随新 tab
+- ✅ `browser_tabs`(`list`/`switch`/`close`/`new`)显式管理——`switch` 会把目标 tab **钉住**,直到有新 tab 出现才让位、恢复自动跟随
 - ❌ **用户在 Chrome UI 里手动切换 tab → 不会跟随**(Playwright CDP 没暴露稳定的"聚焦 tab" API)
-- ❌ 关闭最后一个 tab → 切到倒数第二个;关闭所有 tab → 报错,需 `browser_session` 重建
-- 兜底:用 `browser_eval` 调 `chrome.tabs.update({active: true})` 主动激活
+- ❌ `browser_tabs close` 拒绝关闭最后一个 tab(否则触发整个会话重建);要结束会话用 `browser_close`
 
 📖 **帮用户配置这个 MCP？** 读 [`docs/agent-guide.md`](./docs/agent-guide.md)——摸清环境、装依赖、写配置、验证、踩坑全覆盖。
 

@@ -6,7 +6,7 @@ A standalone **MCP server** that gives any MCP client (Codex, Claude, Grok, Curs
 
 ## Features
 
-- **11 tools**: `browser_session`, `browser_navigate`, `browser_snapshot`, `browser_click`, `browser_type`, `browser_eval`, `browser_storage`, `browser_console`, `browser_wait_human`, `browser_screenshot`, `browser_close`
+- **15 tools**: `browser_session`, `browser_navigate`, `browser_snapshot`, `browser_click`, `browser_type`, `browser_select_option`, `browser_hover`, `browser_tabs`, `browser_handle_dialog`, `browser_eval`, `browser_storage`, `browser_console`, `browser_wait_human`, `browser_screenshot`, `browser_close`
 - **Two session modes**:
   - `real` — `connectOverCDP` to an existing Chrome on port `9222` (reuse your logged-in profile: cookies, sessions, 2FA)
   - `isolated` — `launchPersistentContext` with an independent profile (headed/headless)
@@ -123,6 +123,10 @@ It copies `Cookies` / `Login Data` / `Web Data` / `Local State` from your defaul
 | `browser_snapshot` | Lists interactive elements with `ref` ids. Default `mode=viewport` (only in-viewport, saves tokens); `mode=all` returns all. **`refreshActivePage` runs before every tool call** — newly opened tabs (`<a target="_blank"`> / `window.open()`) are automatically followed. |
 | `browser_click` | Click by `ref` (preferred, e.g. `e3`) or `role` (+`name`). `ref` is validated (`^e\d+$`) and checked for exactly one match (0=stale, >1=duplicate → re-snapshot). |
 | `browser_type` | Fill an input by `ref` (preferred) or `role` (+`name`). Same ref validation as `click`. |
+| `browser_select_option` | Pick a `<select>` option by `ref` (preferred) or `role` (+`name`); `values` is a string/array, or `{label}`/`{value}`/`{index}`. No JS needed. |
+| `browser_hover` | Hover an element by `ref` (preferred) or `role` (+`name`) to trigger hover menus/tooltips. |
+| `browser_tabs` | Manage tabs: `list` / `switch` (by `index`) / `close` / `new` (optional `url`). An explicit `switch` sticks until a new tab opens. |
+| `browser_handle_dialog` | Handle JS dialogs (alert/confirm/prompt). Call **before** the triggering action with `accept`/`dismiss`/`promptText`; `reset` restores default. |
 | `browser_eval` | Run a JS expression in the page (read DOM/storage/fire requests). |
 | `browser_storage` | Read `cookies` / `localStorage` / `sessionStorage`. |
 | `browser_console` | Reads buffered console logs (optional `level` filter). Listener is bound on `context.on("page")`, so console logs from newly opened tabs are also collected. |
@@ -165,11 +169,11 @@ type    { ref: "e2", text: "playwright" }
 
 ## Notes
 
-📌 **Multi-tab behavior** — Every tool call runs `refreshActivePage(s)` first, switching `s.page` to the last entry of `context.pages()`. This means:
+📌 **Multi-tab behavior** — Every tool call runs `refreshActivePage(s)` first. By default it follows the last-created tab, so:
 - ✅ `click <a target="_blank">`, `window.open()`, `browser_navigate` opening a new tab → subsequent operations auto-follow the new tab
+- ✅ `browser_tabs` (`list`/`switch`/`close`/`new`) for explicit control — an explicit `switch` **sticks** (pinned) until a new tab appears, then auto-follow resumes
 - ❌ **Manual tab switching in Chrome UI is NOT tracked** (Playwright CDP exposes no stable "focused tab" API)
-- ❌ Closing the last tab → falls back to the second-to-last; closing all tabs → error, rebuild via `browser_session`
-- Fallback: use `browser_eval` to call `chrome.tabs.update({active: true})`
+- ❌ `browser_tabs close` refuses the last tab (would force a session rebuild) — use `browser_close` to end the session
 
 📖 **Helping a user set up this MCP?** Read [`docs/agent-guide.md`](./docs/agent-guide.md) — environment discovery, install, per-client config (Codex/Claude Desktop/Cursor), Chrome setup, verification, and common pitfalls.
 

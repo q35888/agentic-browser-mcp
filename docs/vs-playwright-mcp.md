@@ -16,13 +16,13 @@
 |---|---|---|
 | **能复用已登录 Chrome** | ✅ `real` 模式连 9222，cookie/session/2FA 全保留 | ❌ 每次新 context，登录态从零开始 |
 | **Chrome 自动拉起** | ✅ 9222 不通自动 spawn 启动脚本 | ✅ 自带 isolated context |
-| **工具数量** | 11 | 24 |
+| **工具数量** | 15 | 24 |
 | **snapshot token 占用** | 低（默认只视口内 + 整行截断）| 中（完整 accessibility tree）|
 | **工具描述语言** | 中文优先 | 英文 |
 | **浏览器内核** | Chromium only | Chromium / Firefox / WebKit |
 | **穿透 Shadow DOM** | ✅ | ✅ |
-| **多 tab 管理** | ❌（需用 `browser_eval` 拼 JS）| ✅ `browser_tabs` |
-| **高级交互（drag/hover/file_upload/dialog/select）** | ❌ | ✅ |
+| **多 tab 管理** | ✅ `browser_tabs`（list/switch/close/new）| ✅ `browser_tabs` |
+| **高级交互（hover/select/dialog ✅；drag/file_upload 仍缺）** | 部分 | ✅ |
 | **跑任意 Playwright 代码** | ❌（`browser_eval` 只在页面里跑 JS）| ✅ `browser_run_code_unsafe` |
 | **运行时依赖** | 3 个（SDK + Playwright + Zod）| Playwright 全家桶 |
 | **维护方** | 个人项目 | Microsoft / Playwright 团队 |
@@ -59,7 +59,7 @@
 
 ### 4. 工具描述中文优先，中文 LLM 受益
 
-11 个工具的 `description` 全部用中文写，参数说明也是中文。对**用中文 prompt 的 LLM**（GLM / Qwen / Kimi / DeepSeek 等）来说，语义匹配更准——LLM 在 tools 列表里找「读 cookies」时，中文描述直接命中。
+15 个工具的 `description` 全部用中文写，参数说明也是中文。对**用中文 prompt 的 LLM**（GLM / Qwen / Kimi / DeepSeek 等）来说，语义匹配更准——LLM 在 tools 列表里找「读 cookies」时，中文描述直接命中。
 
 英文模型（GPT / Claude / Grok）用也没问题，只是收益没那么明显。
 
@@ -69,26 +69,22 @@
 
 ### 6. 轻量
 
-3 个运行时依赖（MCP SDK + Playwright + Zod），单文件 712 行实现全部 11 个工具。整个项目源码读一遍 10 分钟。审计、二次开发、内嵌进自己的工具链都简单。
+3 个运行时依赖（MCP SDK + Playwright + Zod），单文件实现全部 15 个工具。整个项目源码读一遍 10 分钟。审计、二次开发、内嵌进自己的工具链都简单。
 
 ---
 
 ## 诚实的劣势
 
-### 1. 工具更少
+### 1. 工具更少（差距已缩小）
 
-官方 `@playwright/mcp` 有 24 个工具，含一些 agentic-browser-mcp **没有的**：
+官方 `@playwright/mcp` 有 24 个工具。agentic-browser-mcp 现有 15 个，已补齐悬停（`hover`）、下拉（`select_option`）、弹窗（`handle_dialog`）、多 tab（`tabs`）这些高频交互；**仍缺**：
 
 - `browser_drag`（拖拽）
-- `browser_hover`（悬停——触发菜单/tooltip 必需）
 - `browser_file_upload`（文件上传 input）
-- `browser_handle_dialog`（alert/confirm/prompt 弹窗）
-- `browser_select_option`（`<select>` 下拉）
-- `browser_tabs`（多 tab 管理）
 - `browser_fill_form`（一次填多个表单字段）
 - `browser_run_code_unsafe`（直接跑 Playwright 代码，相当于 RCE 能力）
 
-agentic-browser-mcp 缺这些时只能 `browser_eval` 注入 JS 拼——能干，但啰嗦，而且 `eval` 只在页面里跑、不能调 Playwright API。
+缺这些时只能 `browser_eval` 注入 JS 拼——能干，但啰嗦，而且 `eval` 只在页面里跑、不能调 Playwright API。
 
 ### 2. 生态和长期维护
 
@@ -124,7 +120,7 @@ agentic-browser-mcp 是自己写 JS 扫 DOM + 26 个选择器 + 隐式 role 映�
 **选官方 `@playwright/mcp`，如果：**
 
 - 操作公开网站，不需要登录态
-- 要用 drag / hover / file_upload / dialog / 多 tab / 下拉 这些高级交互
+- 要用 drag / file_upload 这些高级交互
 - 要做跨浏览器测试（Firefox / WebKit）
 - 团队偏好有官方背书的成熟生态
 - 需要 `browser_run_code_unsafe` 这种"任意 Playwright 代码"的灵活度

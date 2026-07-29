@@ -27,8 +27,9 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { chromium } from "playwright";
 import { z } from "zod";
-import { mkdirSync, existsSync } from "node:fs";
+import { mkdirSync, existsSync, realpathSync } from "node:fs";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import * as os from "node:os";
 import { spawn } from "node:child_process";
 import * as http from "node:http";
@@ -178,8 +179,29 @@ async function ensureChromeUp() {
 
 // 绑当前 page + 监听后续新 tab(opened via target="_blank" / window.open() / 手动)
 // 都写入同一个 consoleBuffer,避免新 tab 的日志丢失。
+// 会话级钩子初始化:控制台收集 + browser_tabs 的 pinnedPage + browser_handle_dialog 的策略。
 function attachConsoleListener(s) {
   s.consoleBuffer = [];
+  // browser_tabs 显式钉住的 tab:null = 自动跟随最后创建的 tab(见 refreshActivePage)
+  s.pinnedPage = null;
+  // JS 弹窗处理:可变策略 + 全 context 分发的稳定 handler(见 browser_handle_dialog)
+  s._dialogPolicy = null;    // null = 无自定义策略(走 Playwright 默认 auto-dismiss)
+  s._dialogBound = false;    // context.on('page') 分发是否已注册
+  s._dialogApplyTo = null;   // 分发函数引用(reset 时用它 off)
+  // 稳定 handler 引用(同一函数才能 page.off 移除);读 s._dialogPolicy 决定动作
+  s._dialogHandler = async (d) => {
+    const p = s._dialogPolicy;
+    if (!p) { try { await d.dismiss(); } catch {} return; } // 防御:绝不 stall
+    try {
+      if (p.action === "accept") {
+        // 仅 promptText 有值时传参——传空串会清空 prompt 的默认值
+        if (p.promptText !== undefined) await d.accept(p.promptText);
+        else await d.accept();
+      } else {
+        await d.dismiss();
+      }
+    } catch {}
+  };
   const push = (type, text) => {
     try {
       s.consoleBuffer.push({ type, text, ts: Date.now() });
@@ -200,19 +222,28 @@ function attachConsoleListener(s) {
     bindPage(s.page);
     // 后续打开的 tab 也绑,不漏 console
     s.context.on("page", bindPage);
+    // 新 tab 出现 → 取消 browser_tabs 的显式钉住,恢复"自动跟随最后创建的 tab"
+    s.context.on("page", () => { s.pinnedPage = null; });
   } catch {
     /* ignore */
   }
 }
 
 // 刷新"当前活动 page":s.page 原本指向 session 建立时的 tab,但用户/AI 后续
-// 可能打开/切换 tab。这里把 s.page 切到 context 里最后活动的 page。
-// 当 s.page 已关闭或不再是最后一个 page 时自动切换。
+// 可能打开/切换 tab。默认跟随 context 里最后创建的 page(=自动跟随新开的 tab,
+// 因为 Playwright 无稳定 focused-tab API)。
+// 若 browser_tabs 显式切到了某 tab(s.pinnedPage),只要它还开着就保持它,
+// 直到有新 tab 出现(attachConsoleListener 里 context.on('page') 会清 pinnedPage)。
 // 各工具调用前先 refreshActivePage(s) 一次,保证操作的是用户当前看到的页面。
 function refreshActivePage(s) {
   try {
     const pages = s.context.pages();
     if (pages.length === 0) return s.page;
+    const pin = s.pinnedPage;
+    if (pin && !pin.isClosed?.() && pages.includes(pin)) {
+      s.page = pin;
+      return s.page;
+    }
     const last = pages[pages.length - 1];
     if (!s.page || s.page.isClosed?.() || s.page !== last) {
       s.page = last;
@@ -274,11 +305,14 @@ function isAlive(s) {
 async function ensureSession(opts = {}) {
   // 在串行锁内执行,防止并发竞态
   return serialize(async () => {
-    const profile = opts.profile ?? "real";
     if (current && !isAlive(current)) {
       await safeDispose(current);
       current = null;
     }
+    // 无显式 profile 时复用当前会话(若有),没有才默认 real。
+    // 否则 snapshot/click/eval 等工具(都不带 profile)会把 isolated 会话误杀切回 real,
+    // 导致 isolated 模式跨工具调用不可用。
+    const profile = opts.profile ?? (current ? current.type : "real");
     if (current && !opts.force && sameProfile(current, profile, opts.incognito)) {
       return current;
     }
@@ -408,7 +442,7 @@ function createServer() {
   }, async (params) => {
     try {
       const s = await ensureSession({
-        profile: params.profile,
+        profile: params.profile ?? "real",
         headless: params.headless,
         incognito: params.incognito,
         force: params.profile !== undefined,
@@ -782,6 +816,241 @@ function createServer() {
     return ok(`已关闭 ${was} 会话,资源已释放`);
   });
 
+  // 12. select_option —— 下拉选择(小模型友好:免写 el.value+dispatchEvent 的 JS)
+  server.registerTool("browser_select_option", {
+    description:
+      "选择 <select> 下拉框的选项。优先用 snapshot 返回的 ref 定位(如 e3),也可 role+name 回退(select 的 role=combobox)。values 传要选中的项:字符串(模糊匹配 value/label/文本)、字符串数组(多选),或 {label}/{value}/{index} 精确匹配。",
+    inputSchema: {
+      ref: z.string().optional().describe("snapshot 返回的 <select> ref(如 e3),优先使用"),
+      role: z.string().optional().describe("元素 role(ref 未提供时使用,通常 combobox/listbox)"),
+      name: z.string().optional().describe("下拉框的可访问名称"),
+      values: z.union([
+        z.string(),
+        z.array(z.string()),
+        z.object({ label: z.string() }).strict(),
+        z.object({ value: z.string() }).strict(),
+        z.object({ index: z.number().int() }).strict(),
+      ]).describe("要选中的选项:字符串/数组,或 {label}|{value}|{index} 精确匹配"),
+    },
+  }, async (params) => {
+    if (!params.ref && !params.role) return err(
+      "参数缺失",
+      new Error("必须提供 ref 或 role"),
+      `正确用法: 先 browser_snapshot 拿到 <select> 的 ref(通常是 combobox role),然后 select_option({ref: 'e4', values: '要选的选项'})`,
+    );
+    if (params.ref && !/^e\d+$/.test(params.ref)) return err(
+      "ref 非法",
+      new Error(`ref 必须形如 e3,收到 ${params.ref}`),
+      "ref 格式: e + 数字(如 e1, e2, e3),来自最近一次 browser_snapshot 的输出",
+    );
+    try {
+      const s = await ensureSession();
+      refreshActivePage(s);
+      let loc;
+      if (params.ref) {
+        const sel = `[data-agent-ref="${params.ref}"]`;
+        const cnt = await s.page.locator(sel).count();
+        if (cnt === 0) return err(
+          "ref 失效",
+          new Error(`ref=${params.ref} 未命中`),
+          "原因: 上次 snapshot 后页面变了。恢复: 重新调 browser_snapshot 获取新 ref,然后用新 ref 重试 select_option",
+        );
+        if (cnt > 1) return err(
+          "ref 重复",
+          new Error(`ref=${params.ref} 命中 ${cnt} 个(快照内部错误)`),
+          "这不应发生。恢复: 重新调 browser_snapshot,若持续出现请提 issue",
+        );
+        loc = s.page.locator(sel).first();
+      } else {
+        loc = locateByRole(s.page, params.role || "", params.name);
+      }
+      const picked = await loc.selectOption(params.values, { timeout: 10000 });
+      return ok(`已在 ${params.ref ? `ref=${params.ref}` : `${params.role}${params.name ? ` "${params.name}"` : ''}`} 选中,当前选中值: ${toText(picked)}`);
+    } catch (e) {
+      return err(
+        "下拉选择失败",
+        e,
+        "常见原因: 1) 元素不是 <select>(自定义下拉用 browser_click 打开再 click 选项); 2) values 与选项不匹配(selectOption 默认精确匹配,字符串会同时试 value/label/text,重名时改传 {value:'...'} 或 {index:0}); 3) select 被禁用; 排查: 用 browser_eval 执行 [...el.options].map(o=>({t:o.text,v:o.value})) 看可选值",
+      );
+    }
+  });
+
+  // 13. hover —— 鼠标悬停(小模型友好:免写 mouseenter 的 JS)
+  server.registerTool("browser_hover", {
+    description:
+      "鼠标悬停元素,触发悬停菜单/tooltip/二级下拉。优先用 snapshot 返回的 ref 定位(如 e3),也可 role+name 回退。",
+    inputSchema: {
+      ref: z.string().optional().describe("snapshot 返回的元素 ref(如 e3),优先使用"),
+      role: z.string().optional().describe("元素 role(ref 未提供时使用)"),
+      name: z.string().optional().describe("元素的可访问名称"),
+    },
+  }, async (params) => {
+    if (!params.ref && !params.role) return err(
+      "参数缺失",
+      new Error("必须提供 ref 或 role"),
+      `正确用法: 先 browser_snapshot 拿到元素 ref,然后 hover({ref: 'e3'}) 悬停它`,
+    );
+    if (params.ref && !/^e\d+$/.test(params.ref)) return err(
+      "ref 非法",
+      new Error(`ref 必须形如 e3,收到 ${params.ref}`),
+      "ref 格式: e + 数字(如 e1, e2, e3),来自最近一次 browser_snapshot 的输出",
+    );
+    try {
+      const s = await ensureSession();
+      refreshActivePage(s);
+      let loc;
+      if (params.ref) {
+        const sel = `[data-agent-ref="${params.ref}"]`;
+        const cnt = await s.page.locator(sel).count();
+        if (cnt === 0) return err(
+          "ref 失效",
+          new Error(`ref=${params.ref} 未命中`),
+          "原因: 上次 snapshot 后页面变了。恢复: 重新调 browser_snapshot 获取新 ref,然后用新 ref 重试 hover",
+        );
+        if (cnt > 1) return err(
+          "ref 重复",
+          new Error(`ref=${params.ref} 命中 ${cnt} 个(快照内部错误)`),
+          "这不应发生。恢复: 重新调 browser_snapshot,若持续出现请提 issue",
+        );
+        loc = s.page.locator(sel).first();
+      } else {
+        loc = locateByRole(s.page, params.role || "", params.name);
+      }
+      await loc.hover({ timeout: 10000 });
+      return ok(`已悬停 ${params.ref ? `ref=${params.ref}` : `${params.role}${params.name ? ` "${params.name}"` : ''}`}`);
+    } catch (e) {
+      return err(
+        "悬停失败",
+        e,
+        "常见原因: 1) 元素被遮挡(用 browser_eval 滚动到元素: el.scrollIntoView()); 2) 元素在 iframe 里(改用 browser_eval 直接操作); 3) SPA 动态加载的元素(等加载完再 snapshot)",
+      );
+    }
+  });
+
+  // 14. tabs —— 标签页管理(小模型友好:免写 chrome.tabs.* 的 JS)
+  server.registerTool("browser_tabs", {
+    description:
+      "管理多个标签页。action: list=列出所有标签+序号(默认)| switch=切到 index| close=关 index(不传=当前 tab)| new=新开标签(可选 url)。显式 switch 会钉住该 tab 直到有新标签出现;否则默认自动跟随最后打开的标签。",
+    inputSchema: {
+      action: z.enum(["list", "switch", "close", "new"]).optional().describe("list/switch/close/new,默认 list"),
+      index: z.number().int().optional().describe("标签序号(0 起,见 list 输出)。switch/close 使用"),
+      url: z.string().optional().describe("new 时要打开的 URL,不传则 about:blank"),
+    },
+  }, async (params) => {
+    try {
+      const s = await ensureSession();
+      const action = params.action ?? "list";
+      const pages = s.context.pages();
+      if (action === "list") {
+        const lines = await Promise.all(pages.map(async (p, i) =>
+          `[${i}]${p === s.page ? " (当前)" : ""} ${tryUrl(p)} — ${await tryTitle(p)}`));
+        return ok(`共 ${pages.length} 个标签:\n${lines.join("\n") || "(无)"}`);
+      }
+      if (action === "switch") {
+        const idx = params.index ?? -1;
+        if (idx < 0 || idx >= pages.length) return err(
+          "切换失败",
+          new Error(`index ${idx} 超出范围(共 ${pages.length} 个标签,序号 0..${pages.length - 1})`),
+          "先用 browser_tabs({action:'list'}) 看标签序号,再 switch({action:'switch', index:0})",
+        );
+        const target = pages[idx];
+        s.page = target;
+        s.pinnedPage = target; // 钉住:不被 refreshActivePage 的"跟随最后 tab"抢回
+        await target.bringToFront().catch(() => {});
+        return ok(`已切到标签 [${idx}] ${tryUrl(target)}`);
+      }
+      if (action === "new") {
+        // 顺序关键:newPage() 内部触发 'page' 事件会清 pinnedPage,
+        // 所以 s.page/s.pinnedPage 必须在 await 之后赋值(否则被事件清掉)。
+        const p = await s.context.newPage();
+        s.page = p;
+        s.pinnedPage = p;
+        if (params.url) {
+          await p.goto(params.url, { waitUntil: "domcontentloaded", timeout: 30000 }).catch(() => {});
+        }
+        await p.bringToFront().catch(() => {});
+        return ok(`已新开标签 [${s.context.pages().length - 1}] ${tryUrl(p)}`);
+      }
+      if (action === "close") {
+        // 关到最后一个会触发整个 session 拆重建(isolated 关最后 page → isAlive=false),
+        // 与 README 承诺的"回退到倒数第二个"冲突,故拒绝;要结束会话用 browser_close。
+        if (pages.length <= 1) return err(
+          "拒绝关闭",
+          new Error("只剩 1 个标签,关闭会导致会话重建"),
+          "要结束浏览器会话请用 browser_close;若只是想换页面,用 browser_navigate 到新 URL",
+        );
+        let target;
+        if (params.index === undefined) {
+          target = refreshActivePage(s);
+        } else {
+          if (params.index < 0 || params.index >= pages.length) return err(
+            "关闭失败",
+            new Error(`index ${params.index} 超出范围(共 ${pages.length} 个标签)`),
+            "先用 browser_tabs({action:'list'}) 看标签序号",
+          );
+          target = pages[params.index];
+        }
+        await target.close();
+        refreshActivePage(s); // 关后重新选定活动 page(若关的是 pinned,会自然让位)
+        return ok(`已关闭标签,剩余 ${s.context.pages().length} 个`);
+      }
+      return err("未知操作", new Error(`action ${action} 不支持`), "action 必须是 list / switch / close / new");
+    } catch (e) {
+      return err(
+        "标签管理失败",
+        e,
+        "先用 browser_tabs({action:'list'}) 看当前所有标签和序号。switch/close 的 index 是 0 起的序号",
+      );
+    }
+  });
+
+  // 15. handle_dialog —— JS 弹窗处理(小模型友好:弹窗会阻塞页面,免 eval 绕)
+  server.registerTool("browser_handle_dialog", {
+    description:
+      "处理 JS 弹窗(alert/confirm/prompt/beforeunload)。⚠️必须在触发弹窗的动作(如 browser_click 删除)【之前】调用:先设策略,再去点会弹窗的按钮。默认无策略时 Playwright 自动 dismiss(confirm 返回 false)。reset=true 清除策略、恢复默认。",
+    inputSchema: {
+      accept: z.boolean().optional().describe("true=确认/接受(prompt 时填 promptText);false=取消。默认 true"),
+      promptText: z.string().optional().describe("prompt 弹窗要输入的文本(仅 accept=true 生效;不传则用 prompt 默认值)"),
+      reset: z.boolean().optional().describe("true=清除自定义策略,恢复 Playwright 默认(弹窗自动 dismiss)"),
+    },
+  }, async (params) => {
+    try {
+      const s = await ensureSession();
+      refreshActivePage(s);
+      if (params.reset) {
+        // 清策略 + 从所有 page 移除 handler + 撤销 context 分发,恢复 Playwright 默认
+        s._dialogPolicy = null;
+        for (const p of s.context.pages()) {
+          try { p.off("dialog", s._dialogHandler); } catch {}
+        }
+        if (s._dialogBound && s._dialogApplyTo) {
+          try { s.context.off("page", s._dialogApplyTo); } catch {}
+          s._dialogBound = false;
+        }
+        return ok("已恢复默认策略:后续弹窗由 Playwright 自动 dismiss");
+      }
+      const action = params.accept === false ? "dismiss" : "accept";
+      s._dialogPolicy = { action, promptText: params.promptText };
+      // 策略绑到当前所有 page + 注册到 context 接管未来新 page(只注册一次)
+      const applyTo = (page) => { try { page.on("dialog", s._dialogHandler); } catch {} };
+      s.context.pages().forEach(applyTo);
+      if (!s._dialogBound) {
+        s._dialogApplyTo = applyTo;
+        s.context.on("page", applyTo);
+        s._dialogBound = true;
+      }
+      return ok(
+        `已设置:后续弹窗将自动 ${action === "accept" ? "确认" : "取消"}${params.promptText !== undefined ? ` 并输入 ${JSON.stringify(params.promptText)}` : ""}。现在去触发弹窗(如 browser_click)。用 reset=true 恢复默认`,
+      );
+    } catch (e) {
+      return err(
+        "弹窗策略设置失败",
+        e,
+        "JS 弹窗是同步阻塞的:必须在触发弹窗的动作【之前】先调本工具设策略。想要默认 confirm 返回 true 就显式设 accept=true,而不是 reset",
+      );
+    }
+  });
+
   return server;
 }
 
@@ -806,16 +1075,21 @@ async function shutdown(code = 0) {
   process.exit(code);
 }
 
-// stdin EOF:StdioServerTransport 只监听 data/error,client 关 stdin 不会触发 onclose。
-// 补这个监听,防 isolated 浏览器变孤儿。
-process.stdin.on("end", () => void shutdown(0));
-process.stdin.on("close", () => void shutdown(0));
-process.once("beforeExit", () => void cleanup());
-// 信号:第一次优雅退出(带超时兜底);后续信号兜底强退
-for (const sig of ["SIGTERM", "SIGHUP", "SIGINT"]) {
-  process.once(sig, () => void shutdown(0));
-  // 第二次同信号:跳过清理直接退
-  process.on(sig, () => process.exit(130));
+// 进程退出/信号监听:只在作为入口直接运行时安装(见文件末 isMain 守卫)。
+// 被 import(如进程内测试)时不装——避免 beforeExit 误 dispose 测试 session、
+// 抢走测试运行器的 SIGINT、CI 无 stdin 时立即 shutdown 退出。
+function installProcessLifecycle() {
+  // stdin EOF:StdioServerTransport 只监听 data/error,client 关 stdin 不会触发 onclose。
+  // 补这个监听,防 isolated 浏览器变孤儿。
+  process.stdin.on("end", () => void shutdown(0));
+  process.stdin.on("close", () => void shutdown(0));
+  process.once("beforeExit", () => void cleanup());
+  // 信号:第一次优雅退出(带超时兜底);后续信号兜底强退
+  for (const sig of ["SIGTERM", "SIGHUP", "SIGINT"]) {
+    process.once(sig, () => void shutdown(0));
+    // 第二次同信号:跳过清理直接退
+    process.on(sig, () => process.exit(130));
+  }
 }
 
 // ===== 启动 =====
@@ -899,16 +1173,27 @@ async function runHttp(port) {
   });
 }
 
-// main
-const { transport, port } = parseArgs();
-if (transport === "http") {
-  runHttp(port).catch((e) => {
-    console.error("[agentic-browser-mcp] fatal:", e);
-    process.exit(1);
-  });
-} else {
-  runStdio().catch((e) => {
-    console.error("[agentic-browser-mcp] fatal:", e);
-    process.exit(1);
-  });
+// ===== 入口:仅当作为主模块直接运行时启动 server + 装进程监听 =====
+// 被 import(进程内测试复用 createServer)时不自动启动、不抢信号、不退出。
+const fatal = (e) => {
+  console.error("[agentic-browser-mcp] fatal:", e);
+  process.exit(1);
+};
+const isMain = (() => {
+  try {
+    return !!process.argv[1] && realpathSync(process.argv[1]) === fileURLToPath(import.meta.url);
+  } catch {
+    return process.argv[1] === fileURLToPath(import.meta.url);
+  }
+})();
+if (isMain) {
+  installProcessLifecycle();
+  const { transport, port } = parseArgs();
+  if (transport === "http") {
+    runHttp(port).catch(fatal);
+  } else {
+    runStdio().catch(fatal);
+  }
 }
+
+export { createServer };

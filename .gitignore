@@ -11,3 +11,7 @@ node_modules/
 *-profile-*/
 bw-test-profile/
 bw-shots/
+
+# 本地集成测试脚本与项目笔记(不进 git,遵循全局规范)
+_test_tools.mjs
+AGENTS.md

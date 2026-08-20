@@ -415,13 +415,22 @@ async function ensureSession(opts = {}) {
     }
 
     // isolated
+    // 浏览器选择:默认 Playwright 自带 chromium(独立 bundle id,与系统 Chrome
+    // 完全隔离)——若用 channel:'chrome' 启动无头实例,macOS Launch Services
+    // 会把这个看不见的实例注册为"正在运行的 Google Chrome",用户点 Dock
+    // 图标激活的是它,表现为"日常 Chrome 打不开"(顶名 bug,实测复现)。
+    // env 开关 AGENT_BROWSER_ISOLATED_CHANNEL=chrome 切回系统 Chrome
+    // (Linux 服务器等不想下载 playwright chromium 的场景)。
     mkdirSync(ISOLATED_PROFILE, { recursive: true });
     const headless = opts.headless ?? false;
-    const context = await chromium.launchPersistentContext(ISOLATED_PROFILE, {
+    const launchOpts = {
       headless,
-      channel: "chrome",
       args: opts.incognito ? ["--incognito"] : [],
-    });
+    };
+    if (process.env.AGENT_BROWSER_ISOLATED_CHANNEL === "chrome") {
+      launchOpts.channel = "chrome";
+    }
+    const context = await chromium.launchPersistentContext(ISOLATED_PROFILE, launchOpts);
     const page = context.pages()[0] ?? (await context.newPage());
     const s = {
       type: "isolated",

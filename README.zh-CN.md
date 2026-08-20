@@ -34,6 +34,7 @@
 | `AGENT_BROWSER_ISOLATED_PROFILE` | `<AGENT_BROWSER_DIR>/bw-mcp-profile` | isolated 模式 profile 目录 |
 | `AGENT_BROWSER_LOG_FILE` | `os.tmpdir()/agentic-browser-mcp-chrome.log` | Chrome 启动日志路径 |
 | `AGENT_BROWSER_CDP_PORT` | `9222` | Chrome DevTools Protocol 端口 |
+| `AGENT_BROWSER_ISOLATED_CHANNEL` | 未设 | 设为 `chrome` 让 isolated 模式用系统 Chrome 而非 Playwright 自带 chromium。**macOS 慎用**:无头系统 Chrome 会被 macOS 认定为"正在运行的 Chrome",导致点 Dock 图标打不开日常 Chrome(顶名,已改默认规避) |
 
 覆盖示例:
 
@@ -55,6 +56,7 @@ node index.mjs
 git clone https://github.com/q35888/agentic-browser-mcp.git
 cd agentic-browser-mcp
 npm install
+npx playwright install chromium   # 仅 isolated 模式需要(~95MB);只用 real 模式可跳过
 ```
 
 ## 配置你的 MCP client
@@ -192,6 +194,7 @@ type    { ref: "e2", text: "playwright" }
 ## 故障排查
 
 - **`ECONNREFUSED 127.0.0.1:9222` / Chrome 没开** —— `real` 模式下,server 用 `node:http.get /json/version`(`agent:false` 显式不走 `http_proxy`/`https_proxy`,避免 localhost 探测被发到 HTTP 代理)探测 9222 的 DevTools HTTP 服务。**只验 TCP 端口不够**——chrome 启动时序是 先开 TCP → 再起 DevTools HTTP → 再能响应 `/json/version`,只验 TCP 会造成时序竞态(TCP 通但 `connectOverCDP` 立即抛错)。所以必须等 `/json/version` 返回 200。探测不通则调 `spawnStarter()`:优先用 `AGENT_BROWSER_CHROME_STARTER` 脚本(存在才用),**不存在则内置直接 spawn chrome**——跨平台查找可执行文件(Linux `/usr/bin/google-chrome-stable` 等、Windows `Program Files`、macOS `/Applications/Google Chrome.app`),用 `detached:true` + `--remote-debugging-port=${CDP_PORT}` + `--user-data-dir=${CDP_PROFILE}` 启动。轮询最多 20s。自动拉起仍失败,就手动启动 Chrome。
+- **日常 Chrome 点图标打不开(macOS)** —— 旧版 isolated 无头会话用系统 Chrome(`channel:'chrome'`)启动,macOS Launch Services 按 app 包识别,把这个看不见的实例注册成"正在运行的 Google Chrome",点 Dock 图标只是在激活它(永远无窗口)。已修复:isolated 默认改用 Playwright 自带 chromium(独立 bundle id,不冲突);`AGENT_BROWSER_ISOLATED_CHANNEL=chrome` 可切回,但 macOS 无头场景慎用。
 - **`Browser context management is not supported`(connectOverCDP 失败)** —— 两个同症状成因:1) Chrome 以 `--no-sandbox` 启动(macOS 上内置 spawn 曾对所有非 Windows 平台强加,已修复:现在仅 Linux 自动加,`AGENT_BROWSER_NO_SANDBOX=1` 可强制);2) **无窗口僵尸 Chrome**——用户关掉所有窗口后 Chrome 进程不退(macOS 常见),`/json/version` 仍 200 但 `/json/list` 为空。server 已内置自愈:连接失败时先 `PUT /json/new` 开一个 tab 再重试;仍失败则手动重启 Chrome。
 - **`fill: Timeout … element is not visible`** —— 你可能点/输入了一个隐藏元素(如 `0×0`/`opacity:0` 的装饰性控件)。重新 `snapshot`,可见性过滤器现在应能排除它。若确实可见的元素仍失败,可能是 ref 失效——重新 snapshot。
 - **`ref=eN 未命中`(ref 失效)** —— 上次 `snapshot` 后页面变了(导航、动态内容、元素被移除/重渲染)。重新 `snapshot`,用新 ref。

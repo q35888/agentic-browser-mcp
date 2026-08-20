@@ -32,6 +32,7 @@ All paths go through env vars with defaults that fall back to the Pi env layout.
 | `AGENT_BROWSER_ISOLATED_PROFILE` | `<AGENT_BROWSER_DIR>/bw-mcp-profile` | Isolated-mode profile dir |
 | `AGENT_BROWSER_LOG_FILE` | `os.tmpdir()/agentic-browser-mcp-chrome.log` | Chrome startup log |
 | `AGENT_BROWSER_CDP_PORT` | `9222` | Chrome DevTools Protocol port |
+| `AGENT_BROWSER_ISOLATED_CHANNEL` | unset | `chrome` makes isolated mode use the system Chrome instead of Playwright's bundled chromium. **Caution on macOS**: a headless system Chrome registers as "Chrome is running" and blocks your daily Chrome from launching via the Dock (fixed by default) |
 
 Override examples:
 
@@ -53,6 +54,7 @@ All paths in error messages and tool descriptions are dynamic — no hardcoded `
 git clone https://github.com/q35888/agentic-browser-mcp.git
 cd agentic-browser-mcp
 npm install
+npx playwright install chromium   # only needed for isolated mode (~95MB); skip if you only use real mode
 ```
 
 ## Configure your MCP client
@@ -186,6 +188,7 @@ type    { ref: "e2", text: "playwright" }
 ## Troubleshooting
 
 - **`ECONNREFUSED 127.0.0.1:9222` / Chrome not running** — In `real` mode the server probes 9222 via `node:http.get /json/version` (`agent:false` explicitly bypasses `http_proxy`/`https_proxy`, avoiding false "port closed" when your proxy would intercept the localhost probe). **Probing TCP alone is not enough** — Chrome startup order is TCP first → then DevTools HTTP → then `/json/version` responds; checking only TCP causes a race (TCP up but `connectOverCDP` immediately throws). So it waits for `/json/version` 200. If closed, it calls `spawnStarter()`: tries the `AGENT_BROWSER_CHROME_STARTER` script first (if it exists); **otherwise builtin-direct-spawns chrome** — cross-platform executable lookup (Linux `/usr/bin/google-chrome-stable` etc, Windows `Program Files`, macOS `/Applications/Google Chrome.app`), using `detached:true` + `--remote-debugging-port=${CDP_PORT}` + `--user-data-dir=${CDP_PROFILE}`. Polls for up to 20s. If auto-start still fails, launch Chrome manually.
+- **Daily Chrome won't open from the Dock (macOS)** — older versions launched headless isolated sessions with the system Chrome (`channel:'chrome'`); macOS Launch Services tracks apps by bundle, so the invisible instance registered as "Google Chrome (running)" and Dock clicks merely activated it (no window ever appears). Fixed: isolated mode now defaults to Playwright's bundled chromium (separate bundle id, no clash). `AGENT_BROWSER_ISOLATED_CHANNEL=chrome` switches back — use with care in headless macOS scenarios.
 - **`Browser context management is not supported` (connectOverCDP fails)** — two causes with the same symptom: 1) Chrome launched with `--no-sandbox` (the builtin spawn used to force it on all non-Windows platforms — fixed: now auto-added on Linux only, `AGENT_BROWSER_NO_SANDBOX=1` forces it); 2) **windowless zombie Chrome** — after the user closes every window the Chrome process stays alive (common on macOS); `/json/version` still returns 200 but `/json/list` is empty. The server now self-heals: on connect failure it `PUT /json/new` to open one tab and retries; if that fails too, restart Chrome manually.
 - **`fill: Timeout … element is not visible`** — You likely clicked/typed a hidden element (e.g. a `0×0`/`opacity:0` decorative control). Re-run `snapshot`; the visibility filter should now exclude it. If a genuinely visible element still fails, its ref may be stale — re-snapshot.
 - **`ref=eN 未命中` (stale ref)** — The page changed since the last `snapshot` (navigation, dynamic content, element removed/re-rendered). Re-run `snapshot` and use the new ref.

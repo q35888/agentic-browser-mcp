@@ -31,7 +31,7 @@ import { mkdirSync, existsSync, realpathSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import * as os from "node:os";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import * as http from "node:http";
 
 // ===== 路径配置: 环境变量优先,默认值兜底(向后兼容 Pi 环境) =====
@@ -110,12 +110,29 @@ function chromeUp() {
   });
 }
 
-// 查找系统 Chrome 可执行文件
+// 查找系统 Chrome:固定候选路径优先(发行版标准位置),PATH 兜底
+// (homebrew/nix/flatpak 等非标准安装位置)。
 function findChrome() {
   const candidates = IS_WIN ? CHROME_CANDIDATES_WIN : CHROME_CANDIDATES_UNIX;
-  return candidates.find((p) => {
+  const hit = candidates.find((p) => {
     try { return existsSync(p); } catch { return false; }
   });
+  if (hit) return hit;
+  const names = IS_WIN
+    ? ["chrome.exe"]
+    : ["google-chrome-stable", "google-chrome", "chromium-browser", "chromium", "chrome"];
+  for (const name of names) {
+    try {
+      const r = IS_WIN
+        ? spawnSync("where", [name], { encoding: "utf8" })
+        : spawnSync("which", [name], { encoding: "utf8" });
+      if (r.status === 0) {
+        const first = (r.stdout || "").split("\n").map((s) => s.trim()).filter(Boolean)[0];
+        if (first && existsSync(first)) return first;
+      }
+    } catch { /* ignore */ }
+  }
+  return undefined;
 }
 
 function spawnStarter() {
@@ -146,8 +163,13 @@ function spawnStarter() {
     "--disable-default-apps",
     "--disable-popup-blocking",
   ];
-  // Linux 无图形环境兜底(非 headless 模式也需要 DISPLAY)
-  if (!IS_WIN) {
+  // no-sandbox 平台矩阵:Linux 需要(root 环境必需,非 root 兼容);macOS 绝不能加
+  // ——Chrome 151 在 no-sandbox 下拒绝 browser 级 CDP 域(Browser.setDownloadBehavior),
+  // Playwright connectOverCDP 初始化即失败("Browser context management is not supported")。
+  // AGENT_BROWSER_NO_SANDBOX=1 作为跨平台逃生口。
+  const wantNoSandbox = process.env.AGENT_BROWSER_NO_SANDBOX === "1"
+    || (!IS_WIN && process.platform !== "darwin");
+  if (wantNoSandbox) {
     args.push("--no-sandbox");
   }
   try {
@@ -175,6 +197,45 @@ async function ensureChromeUp() {
     if (await chromeUp()) return true;
   }
   return false;
+}
+
+// 无窗口僵尸 Chrome 自愈:用户关掉所有窗口后 Chrome 进程不退(macOS 常见),
+// /json/version 仍 200(chromeUp 判定"活着",不会重新拉起)但 /json/list 为空、
+// browser 级 context 管理被禁——connectOverCDP 初始化即抛
+// "Browser context management is not supported"(与 no-sandbox 同症状)。
+// 恢复:PUT /json/new 开一个 tab(纯 HTTP 跨平台),再重试一次连接。
+function reviveTab() {
+  return new Promise((resolve) => {
+    const req = http.request(
+      { host: "127.0.0.1", port: CDP_PORT, path: "/json/new?about:blank", method: "PUT", agent: false },
+      (res) => {
+        res.resume();
+        res.on("end", () => resolve(res.statusCode === 200));
+      },
+    );
+    req.on("error", () => resolve(false));
+    req.setTimeout(3000, () => {
+      req.destroy();
+      resolve(false);
+    });
+    req.end();
+  });
+}
+
+// connectOverCDP 带自愈:失败先试 reviveTab 再重试一次;仍失败抛原始错误
+async function connectWithRevive() {
+  try {
+    return await chromium.connectOverCDP(CDP_ENDPOINT);
+  } catch (e) {
+    if (await reviveTab()) {
+      try {
+        return await chromium.connectOverCDP(CDP_ENDPOINT);
+      } catch {
+        /* 恢复后仍失败 → 抛原始错误 */
+      }
+    }
+    throw e;
+  }
 }
 
 // 绑当前 page + 监听后续新 tab(opened via target="_blank" / window.open() / 手动)
@@ -266,7 +327,7 @@ function tabHint() {
     if (n > lastTabCount) {
       const added = n - lastTabCount;
       lastTabCount = n;
-      const tip = n >= 6 ? "（标签页偏多,可用 browser_eval 执行 close() 关闭多余的）" : "";
+      const tip = n >= 6 ? "（标签页偏多,可用 browser_tabs close 关闭多余的）" : "";
       return `\n\n📌 新增 ${added} 个标签页,当前共打开 ${n} 个${tip}。`;
     }
     lastTabCount = n; // 关 tab 也同步,避免下次误报
@@ -330,7 +391,7 @@ async function ensureSession(opts = {}) {
           `专用 Chrome(${CDP_PORT})未启动且自动拉起失败。请手动执行 ${CHROME_STARTER}(若脚本不存在,MCP 会内置直接 spawn chrome)`,
         );
       }
-      const browser = await chromium.connectOverCDP(CDP_ENDPOINT);
+      const browser = await connectWithRevive();
       const context = browser.contexts()[0] ?? (await browser.newContext());
       const page = context.pages()[0] ?? (await context.newPage());
       const s = {
